@@ -1,46 +1,67 @@
+import sys
+import os
+
+# Add project root to Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+
 import math
+from typing import Tuple, Optional
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-APP_TITLE = "Volatility Alpha Engine – Option Screener V1"
+from src.polygon_client import get_underlying_bars
+
+APP_TITLE = "Volatility Alpha Engine – Option Screener V1 (Polygon RV)"
 
 
-def fetch_price_history(ticker: str, lookback_days: int = 60) -> pd.DataFrame:
-    """Download recent daily price history for realized volatility calc."""
+# -------------------------------
+# Realized Volatility via Polygon
+# -------------------------------
+def realized_volatility_from_polygon(
+    ticker: str, days: int = 20
+) -> Optional[float]:
+    """
+    Compute annualized realized volatility using Polygon daily bars.
+    Uses log returns of the 'close' prices.
+
+    Returns:
+        float (annualized RV) or None if data unavailable.
+    """
     try:
-        df = yf.download(
-            ticker,
-            period=f"{lookback_days + 30}d",  # extra buffer
-            interval="1d",
-            progress=False,
-        )
-        if df.empty:
-            return pd.DataFrame()
-        df = df.tail(lookback_days + 1)
-        return df
+        # ask for a bit more than needed to be safe
+        df = get_underlying_bars(ticker, days=days + 5)
     except Exception:
-        return pd.DataFrame()
+        return None
 
+    if df is None or df.empty or "close" not in df.columns:
+        return None
 
-def realized_volatility_annualized(df: pd.DataFrame) -> float:
-    """Compute annualized realized volatility from daily close prices."""
-    if df is None or df.empty or "Close" not in df.columns:
-        return np.nan
-    close = df["Close"].dropna()
-    if len(close) < 10:
-        return np.nan
+    close = df["close"].dropna()
+    if len(close) < 2:
+        return None
+
     returns = np.log(close / close.shift(1)).dropna()
     if returns.empty:
-        return np.nan
-    return float(np.sqrt(252) * returns.std())
+        return None
+
+    rv = np.sqrt(252) * returns.std()
+    return float(rv)
 
 
+# -------------------------------
+# Underlying snapshot (price, vol, RV)
+# -------------------------------
 def get_underlying_snapshot(ticker: str) -> dict:
-    """Pull latest price/volume and realized vol for a single ticker."""
+    """
+    Pull latest price/volume using yfinance + realized vol via Polygon.
+    """
     info = {"ticker": ticker}
 
+    # yfinance for last price, day % change, and volume
     try:
         t = yf.Ticker(ticker)
         hist = t.history(period="2d", interval="1d")
@@ -49,7 +70,7 @@ def get_underlying_snapshot(ticker: str) -> dict:
 
         latest = hist.tail(1).iloc[0]
         prev = hist.head(-1).tail(1)
-        prev_close = prev["Close"].iloc[0] if not prev.empty else np.nan
+        prev_close = prev["Close"].iloc[0] if not prev.empty else math.nan
 
         last_price = float(latest["Close"])
         volume = int(latest.get("Volume", 0))
@@ -57,31 +78,38 @@ def get_underlying_snapshot(ticker: str) -> dict:
         if not math.isnan(prev_close) and prev_close != 0:
             day_pct = (last_price / prev_close - 1) * 100
         else:
-            day_pct = np.nan
-
-        # realized vol from ~60 days
-        hist_60 = fetch_price_history(ticker, lookback_days=60)
-        rv_20d = realized_volatility_annualized(hist_60.tail(20))
-        rv_60d = realized_volatility_annualized(hist_60)
+            day_pct = math.nan
 
         info.update(
             {
                 "last_price": last_price,
                 "day_pct": day_pct,
                 "volume": volume,
-                "rv_20d": rv_20d,
-                "rv_60d": rv_60d,
             }
         )
     except Exception:
         # leave partial info
         pass
 
+    # Polygon for realized volatility
+    rv_20d = realized_volatility_from_polygon(ticker, days=20)
+    rv_60d = realized_volatility_from_polygon(ticker, days=60)
+
+    info.update(
+        {
+            "rv_20d": rv_20d,
+            "rv_60d": rv_60d,
+        }
+    )
+
     return info
 
 
+# -------------------------------
+# yfinance options helpers (nearest expiry + ATM IV)
+# -------------------------------
 def get_nearest_exp_chain(ticker: str):
-    """Fetch nearest options expiration + option chain (calls, puts)."""
+    """Fetch nearest options expiration + option chain (calls, puts) via yfinance."""
     try:
         t = yf.Ticker(ticker)
         exps = t.options
@@ -94,7 +122,9 @@ def get_nearest_exp_chain(ticker: str):
         return None, None, None
 
 
-def find_atm_options(calls: pd.DataFrame, puts: pd.DataFrame, spot: float):
+def find_atm_options(
+    calls: pd.DataFrame, puts: pd.DataFrame, spot: float
+) -> Tuple[Optional[pd.Series], Optional[pd.Series]]:
     """Find roughly ATM call and put given spot price."""
     if math.isnan(spot) or spot <= 0:
         return None, None
@@ -105,21 +135,22 @@ def find_atm_options(calls: pd.DataFrame, puts: pd.DataFrame, spot: float):
     if calls is not None and not calls.empty:
         calls = calls.copy()
         calls["dist"] = (calls["strike"] - spot).abs()
-        calls_sorted = calls.sort_values("dist")
-        atm_call = calls_sorted.iloc[0]
+        atm_call = calls.sort_values("dist").iloc[0]
 
     if puts is not None and not puts.empty:
         puts = puts.copy()
         puts["dist"] = (puts["strike"] - spot).abs()
-        puts_sorted = puts.sort_values("dist")
-        atm_put = puts_sorted.iloc[0]
+        atm_put = puts.sort_values("dist").iloc[0]
 
     return atm_call, atm_put
 
 
 def compute_iv_features(
-    calls: pd.DataFrame, puts: pd.DataFrame, atm_call, atm_put
-) -> tuple[float, float]:
+    calls: pd.DataFrame,
+    puts: pd.DataFrame,
+    atm_call: Optional[pd.Series],
+    atm_put: Optional[pd.Series],
+) -> Tuple[float, float]:
     """
     Compute ATM IV (avg of call/put IV) and a simple IV Rank (0-100)
     within the distribution of IVs for this expiration.
@@ -136,11 +167,17 @@ def compute_iv_features(
         atm_iv = np.nan
 
     iv_rank = np.nan
-    if calls is not None and not calls.empty and puts is not None and not puts.empty:
+    if (
+        calls is not None
+        and not calls.empty
+        and puts is not None
+        and not puts.empty
+        and pd.notna(atm_iv)
+    ):
         iv_all = pd.concat(
             [calls["impliedVolatility"], puts["impliedVolatility"]]
         ).dropna()
-        if not iv_all.empty and pd.notna(atm_iv):
+        if not iv_all.empty:
             atm_iv_dec = atm_iv / 100.0
             iv_min = float(iv_all.min())
             iv_max = float(iv_all.max())
@@ -150,6 +187,9 @@ def compute_iv_features(
     return atm_iv, iv_rank
 
 
+# -------------------------------
+# Screener core
+# -------------------------------
 def build_screener_df(tickers: list[str]) -> pd.DataFrame:
     rows = []
     for tk in tickers:
@@ -223,18 +263,21 @@ def build_screener_df(tickers: list[str]) -> pd.DataFrame:
     return df
 
 
+# -------------------------------
+# Layout / UI
+# -------------------------------
 def layout_header():
     st.title(APP_TITLE)
     st.caption(
-        "V1: Screener with realized volatility, ATM implied volatility, IV Rank, and a composite edge score."
+        "V1: Screener with Polygon-based realized volatility, ATM implied volatility, IV Rank, and a composite edge score."
     )
     st.markdown(
         """
 This is your **daily volatility radar**:
 
 - You type in a list of tickers  
-- We pull live data with `yfinance`  
-- We compute realized vol, ATM implied vol, and a simple IV Rank  
+- We pull price/volume with `yfinance` and realized vol from **Polygon**  
+- We compute ATM implied vol and a simple IV Rank  
 - We rank names by a **Daily Edge Score V1**
         """
     )
@@ -263,7 +306,7 @@ def layout_main(df: pd.DataFrame):
         st.warning("No data loaded. Check your tickers and try again.")
         return
 
-    st.subheader("Daily Edge Ranking (V1)")
+    st.subheader("Daily Edge Ranking (V1 – Polygon RV)")
 
     df_display = df[
         [
@@ -294,13 +337,14 @@ def layout_main(df: pd.DataFrame):
                 "Edge Score": "{:.1f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown(
         """
 **How to read this:**
 
+- **RV 20d / 60d** – realized volatility from Polygon daily bars  
 - **ATM IV %** – average implied vol of the at-the-money call/put  
 - **IV Rank %** – where today's ATM IV sits within the IV range for that expiration (0 = low, 100 = high)  
 - **Edge Score** – composite of move, volume, realized vol, and IV Rank  
@@ -349,7 +393,7 @@ def layout_main(df: pd.DataFrame):
     ].copy()
     calls_view["impliedVolatility"] = calls_view["impliedVolatility"] * 100.0
     calls_view = calls_view.rename(columns={"impliedVolatility": "IV %"})
-    st.dataframe(calls_view, use_container_width=True)
+    st.dataframe(calls_view, width="stretch")
 
     st.markdown(f"### Puts – {nearest_exp}")
     puts_view = puts[
@@ -366,7 +410,7 @@ def layout_main(df: pd.DataFrame):
     ].copy()
     puts_view["impliedVolatility"] = puts_view["impliedVolatility"] * 100.0
     puts_view = puts_view.rename(columns={"impliedVolatility": "IV %"})
-    st.dataframe(puts_view, use_container_width=True)
+    st.dataframe(puts_view, width="stretch")
 
 
 def main():
@@ -377,7 +421,7 @@ def main():
         st.info("Enter at least one ticker to run the screener.")
         return
 
-    with st.spinner("Running screener… pulling live market + options data."):
+    with st.spinner("Running screener… pulling data from yfinance + Polygon."):
         df = build_screener_df(tickers)
 
     layout_main(df)

@@ -53,3 +53,25 @@ def get_underlying_last_price(ticker: str) -> float | None:
         return None
     return float(df["close"].iloc[-1])
 
+import numpy as np
+
+def realized_volatility_from_polygon(ticker: str, days: int = 20) -> float | None:
+    """
+    Compute annualized realized volatility using Polygon daily bars.
+    """
+    df = get_underlying_bars(ticker, days=days+1)
+    if df.empty or "close" not in df.columns:
+        return None
+
+    close = df["close"].dropna()
+    if len(close) < 2:
+        return None
+
+    returns = np.log(close / close.shift(1)).dropna()
+    if returns.empty:
+        return None
+
+    rv = np.sqrt(252) * returns.std()
+    return float(rv)
+
+
