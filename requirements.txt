@@ -5,3 +5,4 @@ yfinance>=0.2.40
 python-dotenv>=1.0.0
 requests>=2.32.0
 polygon-api-client>=1.14.0
+openai>=1.40.0
