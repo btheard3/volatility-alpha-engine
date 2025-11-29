@@ -1,13 +1,10 @@
 import math
-from datetime import datetime, timedelta
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-
-APP_TITLE = "Volatility Alpha Engine – Option Screener V0"
+APP_TITLE = "Volatility Alpha Engine – Option Screener V1"
 
 
 def fetch_price_history(ticker: str, lookback_days: int = 60) -> pd.DataFrame:
@@ -106,16 +103,51 @@ def find_atm_options(calls: pd.DataFrame, puts: pd.DataFrame, spot: float):
     atm_put = None
 
     if calls is not None and not calls.empty:
+        calls = calls.copy()
         calls["dist"] = (calls["strike"] - spot).abs()
         calls_sorted = calls.sort_values("dist")
         atm_call = calls_sorted.iloc[0]
 
     if puts is not None and not puts.empty:
+        puts = puts.copy()
         puts["dist"] = (puts["strike"] - spot).abs()
         puts_sorted = puts.sort_values("dist")
         atm_put = puts_sorted.iloc[0]
 
     return atm_call, atm_put
+
+
+def compute_iv_features(
+    calls: pd.DataFrame, puts: pd.DataFrame, atm_call, atm_put
+) -> tuple[float, float]:
+    """
+    Compute ATM IV (avg of call/put IV) and a simple IV Rank (0-100)
+    within the distribution of IVs for this expiration.
+    """
+    atm_iv = np.nan
+
+    call_iv = getattr(atm_call, "impliedVolatility", np.nan)
+    put_iv = getattr(atm_put, "impliedVolatility", np.nan)
+
+    vals = [v for v in [call_iv, put_iv] if pd.notna(v)]
+    if vals:
+        atm_iv = float(np.mean(vals)) * 100.0  # convert to %
+    else:
+        atm_iv = np.nan
+
+    iv_rank = np.nan
+    if calls is not None and not calls.empty and puts is not None and not puts.empty:
+        iv_all = pd.concat(
+            [calls["impliedVolatility"], puts["impliedVolatility"]]
+        ).dropna()
+        if not iv_all.empty and pd.notna(atm_iv):
+            atm_iv_dec = atm_iv / 100.0
+            iv_min = float(iv_all.min())
+            iv_max = float(iv_all.max())
+            if iv_max > iv_min:
+                iv_rank = (atm_iv_dec - iv_min) / (iv_max - iv_min) * 100.0
+
+    return atm_iv, iv_rank
 
 
 def build_screener_df(tickers: list[str]) -> pd.DataFrame:
@@ -133,9 +165,13 @@ def build_screener_df(tickers: list[str]) -> pd.DataFrame:
         rv_60d = snapshot.get("rv_60d", np.nan)
 
         nearest_exp, calls, puts = get_nearest_exp_chain(tk)
+
         atm_call, atm_put = None, None
-        if nearest_exp is not None:
+        atm_iv, iv_rank = np.nan, np.nan
+        if nearest_exp is not None and calls is not None and puts is not None:
             atm_call, atm_put = find_atm_options(calls, puts, last)
+            if atm_call is not None or atm_put is not None:
+                atm_iv, iv_rank = compute_iv_features(calls, puts, atm_call, atm_put)
 
         row = {
             "Ticker": tk,
@@ -145,6 +181,8 @@ def build_screener_df(tickers: list[str]) -> pd.DataFrame:
             "RV 20d": rv_20d,
             "RV 60d": rv_60d,
             "Nearest Exp": nearest_exp,
+            "ATM IV %": atm_iv,
+            "IV Rank %": iv_rank,
             "ATM Call Strike": getattr(atm_call, "strike", np.nan),
             "ATM Call Bid": getattr(atm_call, "bid", np.nan),
             "ATM Call Ask": getattr(atm_call, "ask", np.nan),
@@ -161,13 +199,11 @@ def build_screener_df(tickers: list[str]) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    # build simple "Daily Edge Score" based on:
-    # - absolute daily move
-    # - volume
-    # - short-term realized vol
+    # "Daily Edge Score V1" based on move, volume, realized vol, and IV rank
     df["Abs Day %"] = df["Day %"].abs()
 
-    for col in ["Abs Day %", "Volume", "RV 20d"]:
+    rank_cols = ["Abs Day %", "Volume", "RV 20d", "IV Rank %"]
+    for col in rank_cols:
         if col in df.columns:
             valid = df[col].replace([np.inf, -np.inf], np.nan).dropna()
             if valid.empty:
@@ -181,7 +217,8 @@ def build_screener_df(tickers: list[str]) -> pd.DataFrame:
         df["Abs Day % Rank"].fillna(0)
         + df["Volume Rank"].fillna(0)
         + df["RV 20d Rank"].fillna(0)
-    ) / 3 * 100
+        + df["IV Rank % Rank"].fillna(0)
+    ) / 4 * 100
 
     return df
 
@@ -189,16 +226,16 @@ def build_screener_df(tickers: list[str]) -> pd.DataFrame:
 def layout_header():
     st.title(APP_TITLE)
     st.caption(
-        "V0: Quick-and-dirty options screener based on price move, volume, and realized volatility."
+        "V1: Screener with realized volatility, ATM implied volatility, IV Rank, and a composite edge score."
     )
     st.markdown(
         """
-This is a **refresher + foundation piece** for Volatility Alpha Engine:
+This is your **daily volatility radar**:
 
 - You type in a list of tickers  
 - We pull live data with `yfinance`  
-- We rank them by a simple **Daily Edge Score**  
-- You can then drill into the nearest-expiration options chain
+- We compute realized vol, ATM implied vol, and a simple IV Rank  
+- We rank names by a **Daily Edge Score V1**
         """
     )
 
@@ -212,21 +249,13 @@ def layout_sidebar():
         help="Enter any list of optionable tickers.",
     )
 
-    lookback_info = st.sidebar.slider(
-        "Lookback days for realized vol (display only)",
-        min_value=20,
-        max_value=90,
-        value=60,
-        step=10,
-    )
-
     st.sidebar.markdown("---")
     st.sidebar.caption(
-        "Tip: Start with index ETFs + your favorite high-beta names to watch how the ranking behaves."
+        "Tip: Start with index ETFs + high-beta names to see where the action is."
     )
 
     tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-    return tickers, lookback_info
+    return tickers
 
 
 def layout_main(df: pd.DataFrame):
@@ -234,7 +263,7 @@ def layout_main(df: pd.DataFrame):
         st.warning("No data loaded. Check your tickers and try again.")
         return
 
-    st.subheader("Daily Edge Ranking")
+    st.subheader("Daily Edge Ranking (V1)")
 
     df_display = df[
         [
@@ -244,6 +273,8 @@ def layout_main(df: pd.DataFrame):
             "Volume",
             "RV 20d",
             "RV 60d",
+            "ATM IV %",
+            "IV Rank %",
             "Nearest Exp",
             "Edge Score",
         ]
@@ -258,6 +289,8 @@ def layout_main(df: pd.DataFrame):
                 "Day %": "{:+.2f}%",
                 "RV 20d": "{:.2f}",
                 "RV 60d": "{:.2f}",
+                "ATM IV %": "{:.1f}",
+                "IV Rank %": "{:.1f}",
                 "Edge Score": "{:.1f}",
             }
         ),
@@ -266,17 +299,14 @@ def layout_main(df: pd.DataFrame):
 
     st.markdown(
         """
-**Daily Edge Score (0–100)** is a simple composite of:
+**How to read this:**
 
-- Absolute daily % move (bigger = more interesting)  
-- Volume rank  
-- Short-term realized volatility  
-
-Later versions of Volatility Alpha will replace this with ML/RL-powered signals.
+- **ATM IV %** – average implied vol of the at-the-money call/put  
+- **IV Rank %** – where today's ATM IV sits within the IV range for that expiration (0 = low, 100 = high)  
+- **Edge Score** – composite of move, volume, realized vol, and IV Rank  
         """
     )
 
-    # details for a selected ticker
     st.markdown("---")
     st.subheader("Options Detail – Nearest Expiration")
 
@@ -293,6 +323,8 @@ Later versions of Volatility Alpha will replace this with ML/RL-powered signals.
 - Volume: `{int(row['Volume']):,}`  
 - RV 20d: `{row['RV 20d']:.2f}`  
 - RV 60d: `{row['RV 60d']:.2f}`  
+- ATM IV %: `{row['ATM IV %']:.1f}`  
+- IV Rank %: `{row['IV Rank %']:.1f}`  
 - Nearest Expiration: `{row['Nearest Exp']}`
         """
     )
@@ -304,20 +336,42 @@ Later versions of Volatility Alpha will replace this with ML/RL-powered signals.
 
     st.markdown(f"### Calls – {nearest_exp}")
     calls_view = calls[
-        ["contractSymbol", "strike", "lastPrice", "bid", "ask", "volume", "openInterest"]
+        [
+            "contractSymbol",
+            "strike",
+            "lastPrice",
+            "bid",
+            "ask",
+            "impliedVolatility",
+            "volume",
+            "openInterest",
+        ]
     ].copy()
+    calls_view["impliedVolatility"] = calls_view["impliedVolatility"] * 100.0
+    calls_view = calls_view.rename(columns={"impliedVolatility": "IV %"})
     st.dataframe(calls_view, use_container_width=True)
 
     st.markdown(f"### Puts – {nearest_exp}")
     puts_view = puts[
-        ["contractSymbol", "strike", "lastPrice", "bid", "ask", "volume", "openInterest"]
+        [
+            "contractSymbol",
+            "strike",
+            "lastPrice",
+            "bid",
+            "ask",
+            "impliedVolatility",
+            "volume",
+            "openInterest",
+        ]
     ].copy()
+    puts_view["impliedVolatility"] = puts_view["impliedVolatility"] * 100.0
+    puts_view = puts_view.rename(columns={"impliedVolatility": "IV %"})
     st.dataframe(puts_view, use_container_width=True)
 
 
 def main():
     layout_header()
-    tickers, _ = layout_sidebar()
+    tickers = layout_sidebar()
 
     if not tickers:
         st.info("Enter at least one ticker to run the screener.")
