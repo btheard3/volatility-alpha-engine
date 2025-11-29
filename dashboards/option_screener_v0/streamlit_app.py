@@ -2,15 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-
-# --- Make project root importable so "src" works ---
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-# ---------------------------------------------------
-
-import datetime as dt
 from typing import Any, Dict, List
 
 import numpy as np
@@ -18,60 +9,72 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-from src.polygon_client import (
-    compute_realized_vol,
+# --- Make project root importable so we can do "from src..." ---
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+# ----------------------------------------------------------------
+
+from src.polygon_client import (  # type: ignore
     get_underlying_bars,
-    get_underlying_last_price,
-    get_nearest_expiration_chain,
+    compute_realized_vol,
 )
 
-
-# ---------------------------------------------------------------------
-# Streamlit config
-# ---------------------------------------------------------------------
-
+# ----------------------------------------------------------------
+# Streamlit page config
+# ----------------------------------------------------------------
 st.set_page_config(
     page_title="Volatility Alpha Engine – Option Screener V1",
-    page_icon="📈",
     layout="wide",
 )
 
-# ---------------------------------------------------------------------
-# Sidebar – inputs
-# ---------------------------------------------------------------------
+st.title("Volatility Alpha Engine – Option Screener V1 (Polygon RV)")
+st.markdown(
+    """
+V1: Screener with Polygon-based realized volatility, ATM implied volatility (placeholder),
+IV Rank (placeholder), and a composite edge score.
 
-st.sidebar.header("Screener Settings")
-tickers_raw = st.sidebar.text_input(
-    "Tickers (comma-separated)",
-    value="SPY, QQQ, TSLA, NVDA, AMD",
-    help="Start with index ETFs + high-beta names to see where the action is.",
-)
-run_button = st.sidebar.button("Run Screener")
+This is your **daily volatility radar**:
 
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    "Tip: Keep the list short (5–15 tickers) to avoid rate limits on free data tiers."
+- You type in a list of tickers  
+- We pull price/volume with `yfinance` and realized vol from **Polygon**  
+- We compute a simple Daily Edge Score V1  
+- We rank names by that edge score
+"""
 )
 
-tickers: List[str] = [
-    t.strip().upper() for t in tickers_raw.split(",") if t.strip()
-]
+# ----------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------
-# Helper to pull metrics for a single ticker
-# ---------------------------------------------------------------------
+def _parse_ticker_input(raw: str) -> List[str]:
+    """Split comma/space separated tickers, clean and dedupe."""
+    if not raw:
+        return []
+    parts = [p.strip().upper() for p in raw.replace("\n", ",").split(",")]
+    tickers = [p for p in parts if p]
+    # keep order but drop duplicates
+    seen = set()
+    ordered: List[str] = []
+    for t in tickers:
+        if t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    return ordered
 
 
 def _fetch_ticker_row(symbol: str) -> Dict[str, Any]:
     """
     Fetch metrics for one underlying:
-    - Always tries to return price / day % / volume from yfinance
-    - Tries Polygon for RV + nearest expiration, but falls back cleanly
+    - Always returns price / day % / volume from yfinance
+    - Tries Polygon for RV 20d / 60d (soft-fail)
+    - Nearest expiration currently disabled (to avoid 429 spam)
     """
     symbol = symbol.upper()
 
-    # --- 1. Base price / volume from yfinance (this MUST work or we fail loudly) ---
+    # --- 1. Base price / volume from yfinance ---
     hist = yf.download(symbol, period="5d", interval="1d", progress=False)
     if hist.empty or len(hist) < 2: # type: ignore
         raise RuntimeError(f"No price history for {symbol} from yfinance")
@@ -93,21 +96,21 @@ def _fetch_ticker_row(symbol: str) -> Dict[str, Any]:
         bars = get_underlying_bars(symbol, days=90)
         rv_20d = compute_realized_vol(bars, window=20)
         rv_60d = compute_realized_vol(bars, window=60)
-    except Exception as e:  # soft fail
+    except Exception as e:  # noqa: BLE001
         print(f"[WARN] RV failed for {symbol}: {e!r}")
 
-    # --- 4. Polygon nearest expiration (soft-fail) ---
-    try:
-        exp, calls, puts = get_nearest_expiration_chain(symbol)
-        nearest_exp = exp
-    except Exception as e:
-        print(f"[WARN] chain failed for {symbol}: {e!r}")
+    # --- 4. Nearest expiration / chain (temporarily disabled) ---
+    # TODO: Re-enable when we add a “click to load options chain” UI
+    # try:
+    #     exp, calls, puts = get_nearest_expiration_chain(symbol)
+    #     nearest_exp = exp
+    # except Exception as e:
+    #     print(f"[WARN] chain failed for {symbol}: {e!r}")
 
     # --- 5. Simple edge score V1 ---
     components: list[float] = [abs(day_pct)]
     if not np.isnan(rv_20d):
         components.append(rv_20d)
-
     edge_score = float(np.mean(components)) if components else float("nan")
 
     return {
@@ -122,105 +125,108 @@ def _fetch_ticker_row(symbol: str) -> Dict[str, Any]:
     }
 
 
+def _build_screener_table(tickers: List[str]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for t in tickers:
+        try:
+            row = _fetch_ticker_row(t)
+            rows.append(row)
+        except Exception as e:  # noqa: BLE001
+            print(f"[ERROR] failed for {t}: {e!r}")
+            rows.append(
+                {
+                    "ticker": t.upper(),
+                    "last_price": float("nan"),
+                    "day_pct": float("nan"),
+                    "volume": float("nan"),
+                    "rv_20d": float("nan"),
+                    "rv_60d": float("nan"),
+                    "edge_score": float("nan"),
+                    "nearest_exp": None,
+                }
+            )
 
-# ---------------------------------------------------------------------
-# Main layout
-# ---------------------------------------------------------------------
+    if not rows:
+        return pd.DataFrame()
 
-st.title("Volatility Alpha Engine – Option Screener V1 (Polygon RV)")
-st.markdown(
+    df = pd.DataFrame(rows)
+    df = df.sort_values("edge_score", ascending=False).reset_index(drop=True)
+    return df
+
+
+def _format_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    def fmt_price(x: float) -> str:
+        return "None" if np.isnan(x) else f"{x:.2f}"
+
+    def fmt_pct(x: float) -> str:
+        return "None" if np.isnan(x) else f"{x:+.2f}%"
+
+    def fmt_pos_pct(x: float) -> str:
+        return "None" if np.isnan(x) else f"{x:.2f}%"
+
+    def fmt_vol(x: float) -> str:
+        return "None" if np.isnan(x) else f"{x:,.0f}"
+
+    display = pd.DataFrame(
+        {
+            "Ticker": df["ticker"],
+            "Last Price": df["last_price"].map(fmt_price),
+            "Day %": df["day_pct"].map(fmt_pct),
+            "Volume": df["volume"].map(fmt_vol),
+            "RV 20d": df["rv_20d"].map(fmt_pos_pct),
+            "RV 60d": df["rv_60d"].map(fmt_pos_pct),
+            "Daily Edge Score": df["edge_score"].map(fmt_pos_pct),
+            "Nearest Exp": df["nearest_exp"].fillna("None"),
+        }
+    )
+    display.index = np.arange(1, len(display) + 1) # type: ignore
+    return display
+
+
+# ----------------------------------------------------------------
+# Sidebar – input
+# ----------------------------------------------------------------
+
+st.sidebar.header("Screener Settings")
+raw_tickers = st.sidebar.text_input(
+    "Tickers (comma-separated)",
+    value="SPY, QQQ, TSLA, NVDA, AMD",
+    help="Enter stock tickers separated by commas.",
+)
+
+st.sidebar.markdown(
     """
-V1: Screener with **Polygon-based realized volatility**, ATM implied volatility (future),
-IV Rank, and a composite edge score.
-
-This is your **daily volatility radar**:
-- You type in a list of tickers  
-- We pull price & volume with `yfinance` and realized vol from **Polygon/Massive**  
-- We compute **20-day and 60-day realized volatility**  
-- We rank names by a **Daily Edge Score V1**
+Tip: Start with index ETFs + high-beta names to see where the action is.
 """
 )
 
-if not run_button:
-    st.info("👈 Enter tickers and hit **Run Screener** to pull live data.")
-    st.stop()
+tickers = _parse_ticker_input(raw_tickers)
+
+# ----------------------------------------------------------------
+# Main table
+# ----------------------------------------------------------------
 
 if not tickers:
-    st.warning("Please enter at least one ticker.")
-    st.stop()
+    st.info("Add at least one ticker in the sidebar to run the screener.")
+else:
+    st.subheader("Daily Edge Ranking (V1 – Polygon RV)")
+    raw_df = _build_screener_table(tickers)
+    display_df = _format_for_display(raw_df)
+    st.dataframe(display_df, width="stretch")
 
-rows: List[Dict[str, Any]] = []
-for symbol in tickers:
-    rows.append(_fetch_ticker_row(symbol))
+    st.markdown(
+        """
+### How to read this
 
-df = pd.DataFrame(rows)
-
-if df.empty:
-    st.error("No data returned. Check your tickers and try again.")
-    st.stop()
-
-# Sort by edge_score descending
-df_sorted = df.sort_values("edge_score", ascending=False).reset_index(drop=True)
-
-# Nicely formatted view
-display_df = df_sorted.copy()
-display_df.index = display_df.index + 1  # 1-based ranking
-display_df.rename(
-    columns={
-        "ticker": "Ticker",
-        "last_price": "Last Price",
-        "day_pct": "Day %",
-        "volume": "Volume",
-        "rv_20d": "RV 20d",
-        "rv_60d": "RV 60d",
-        "edge_score": "Daily Edge Score",
-        "nearest_exp": "Nearest Exp",
-    },
-    inplace=True,
-)
-
-# Formatting helpers
-def _fmt_pct(x: Any) -> str:
-    return f"{x:,.2f}%" if pd.notna(x) else "–"
-
-
-def _fmt_price(x: Any) -> str:
-    return f"{x:,.2f}" if pd.notna(x) else "–"
-
-
-def _fmt_int(x: Any) -> str:
-    return f"{int(x):,}" if pd.notna(x) else "–"
-
-
-st.subheader("Daily Edge Ranking (V1 – Polygon RV)")
-
-st.dataframe(
-    display_df.style.format(
-        {
-            "Last Price": _fmt_price,
-            "Day %": _fmt_pct,
-            "Volume": _fmt_int,
-            "RV 20d": _fmt_pct,
-            "RV 60d": _fmt_pct,
-            "Daily Edge Score": _fmt_pct,
-        }
-    ),
-    use_container_width=True,
-)
-
-st.markdown("### How to read this")
-st.markdown(
-    """
 - **Last Price** – latest close from Yahoo Finance  
 - **Day %** – today’s % move vs. prior close  
-- **RV 20d / 60d** – annualized realized volatility over the last 20 / 60 trading days  
-- **Daily Edge Score** – simple V1 composite of short-term move + realized vol  
-- **Nearest Exp** – closest listed options expiration Massive/Polygon can see  
-
-V2/V3 will add:
-- ATM IV %, IV Rank %, and skew  
-- Strategy filters (iron condors, strangles, directional plays)  
-- Visual gauges and color-coded risk bands
+- **RV 20d / RV 60d** – annualized realized volatility from Polygon based on the last 20 / 60 trading days  
+- **Daily Edge Score** – simple composite: average of |Day %| and RV 20d (for now)  
+- **Nearest Exp** – placeholder until we re-enable the options chain lookup
 """
-)
-
+    )
