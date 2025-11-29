@@ -9,20 +9,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from dotenv import load_dotenv
 from openai import OpenAI
-
-# ----------------------------------------------------------------
-# ENV + OpenAI client
-# ----------------------------------------------------------------
-
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ----------------------------------------------------------------
 # Make project root importable so we can do "from src..."
 # ----------------------------------------------------------------
-
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
 if PROJECT_ROOT not in sys.path:
@@ -36,7 +27,6 @@ from src.polygon_client import (  # type: ignore  # noqa: E402
 # ----------------------------------------------------------------
 # Streamlit page config
 # ----------------------------------------------------------------
-
 st.set_page_config(
     page_title="Volatility Alpha Engine – Option Screener V1",
     layout="wide",
@@ -80,17 +70,15 @@ def _parse_ticker_input(raw: str) -> List[str]:
 def _fetch_ticker_row(symbol: str) -> Dict[str, Any]:
     """
     Fetch metrics for one underlying:
-
     - Always returns price / day % / volume from yfinance
-    - Tries Polygon for RV 20d / 60d (soft-fail, uses cache in polygon_client)
+    - Tries Polygon for RV 20d / 60d (soft-fail)
     - Nearest expiration currently disabled (to avoid 429 spam)
     """
     symbol = symbol.upper()
 
     # --- 1. Base price / volume from yfinance ---
     hist = yf.download(symbol, period="5d", interval="1d", progress=False)
-
-    if hist.empty or len(hist) < 2:  # type: ignore[truthy-function]
+    if hist.empty or len(hist) < 2:  # type: ignore[arg-type]
         raise RuntimeError(f"No price history for {symbol} from yfinance")
 
     last = hist.iloc[-1]  # type: ignore[index]
@@ -241,41 +229,27 @@ def generate_ai_insights(df: pd.DataFrame) -> str:
     (professional + beginner-friendly) explanation of today's volatility.
     """
 
-    if df.empty:
-        return "No data available for AI insights today."
+    api_key = os.getenv("OPENAI_API_KEY")
 
     # If no key, keep the app from crashing
-    if not os.getenv("OPENAI_API_KEY"):
+    if not api_key:
         return (
             "AI insights are disabled. Add `OPENAI_API_KEY` to your `.env` file "
             "to see an automatic explanation of today's volatility and trade ideas."
         )
 
+    client = OpenAI(api_key=api_key)
+
     cols_for_ai = [
-        "ticker",
-        "last_price",
-        "day_pct",
-        "volume",
-        "rv_20d",
-        "rv_60d",
-        "edge_score",
+        "Ticker",
+        "Last Price",
+        "Day %",
+        "Volume",
+        "RV 20d",
+        "RV 60d",
+        "Daily Edge Score",
     ]
-
     table = df[cols_for_ai].copy()
-
-    # Rename to human-readable column names for the prompt
-    table = table.rename(
-        columns={
-            "ticker": "Ticker",
-            "last_price": "Last Price",
-            "day_pct": "Day %",
-            "volume": "Volume",
-            "rv_20d": "RV 20d",
-            "rv_60d": "RV 60d",
-            "edge_score": "Daily Edge Score",
-        }
-    )
-
     csv_snapshot = table.to_csv(index=False)
 
     prompt = f"""
@@ -370,7 +344,6 @@ if not tickers:
     st.info("Add at least one ticker in the sidebar to run the screener.")
     st.stop()
 
-# Build raw numeric table
 raw_df = _build_screener_table(tickers)
 if raw_df.empty:
     st.error("No data returned for the given tickers.")
@@ -380,7 +353,7 @@ if raw_df.empty:
 total_names = len(raw_df)
 
 valid_edge = raw_df["edge_score"].replace([np.inf, -np.inf], np.nan)
-max_edge = float(valid_edge.max(skipna=True))
+max_edge = valid_edge.max(skipna=True)
 max_edge_row = raw_df.loc[valid_edge.idxmax()] if not np.isnan(max_edge) else None
 
 valid_rv20 = raw_df["rv_20d"].replace([np.inf, -np.inf], np.nan)
@@ -468,7 +441,7 @@ with chart_col1:
             .properties(height=320)
         )
 
-        st.altair_chart(scatter, use_container_width=True)
+        st.altair_chart(scatter, width="stretch")
 
 # Bar: Top 5 Edge Opportunities
 with chart_col2:
@@ -496,16 +469,13 @@ with chart_col2:
             )
             .properties(height=320)
         )
-        st.altair_chart(bar, use_container_width=True)
-
-# ---------------- AI Insights ----------------
-st.markdown("---")
-st.subheader("AI Volatility Insights (Beta)")
-
-ai_text = generate_ai_insights(raw_df)
-st.markdown(ai_text)
+        st.altair_chart(bar, width="stretch")
 
 # ---------------- Explainer ----------------
+st.markdown("### Big Picture")
+insights_df = styled.data if hasattr(styled, "data") else raw_df  # type: ignore[attr-defined]
+st.write(generate_ai_insights(insights_df.rename(columns=str)))
+
 st.markdown(
     """
 ### How to read this
