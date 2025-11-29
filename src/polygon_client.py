@@ -1,279 +1,369 @@
+from __future__ import annotations
+
 import os
-from datetime import datetime, timedelta
+import json
+import datetime as dt
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from polygon import RESTClient
 
-# Load .env variables
+# Massive / Polygon REST client ---------------------------------------------
+# The package was historically "polygon-api-client" but the namespace
+# rebranded to "massive". We try massive first, then polygon for safety.
+
+try:  # new name
+    from massive import RESTClient  # type: ignore
+except ImportError:  # fallback for older installs
+    from polygon import RESTClient  # type: ignore
+
+
 load_dotenv()
+_POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
-_POLYGON_KEY = os.getenv("POLYGON_API_KEY")
+if not _POLYGON_API_KEY:
+    raise RuntimeError(
+        "POLYGON_API_KEY is not set. "
+        "Add it to your .env so the Volatility Alpha Engine can use Polygon."
+    )
 
-# Project root & cache directories
-BASE_DIR = Path(__file__).resolve().parents[1]
-CACHE_DIR = BASE_DIR / "data" / "cache_polygon"
-EXP_CACHE_DIR = CACHE_DIR / "expirations"
-CHAIN_CACHE_DIR = CACHE_DIR / "chains"
-
-for p in [EXP_CACHE_DIR, CHAIN_CACHE_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
-
+# Simple singleton client
+_client: Optional[RESTClient] = None
 
 
 def _get_client() -> RESTClient:
-    """Return a Polygon REST client with API key loaded."""
-    if not _POLYGON_KEY:
-        raise RuntimeError("POLYGON_API_KEY not set in .env")
-    return RESTClient(api_key=_POLYGON_KEY)
+    global _client
+    if _client is None:
+        _client = RESTClient(api_key=_POLYGON_API_KEY)  # type: ignore[call-arg]
+    return _client
+
+
+# ---------------------------------------------------------------------------
+# Disk caching helpers (so we don't hammer the free API tier)
+# ---------------------------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+CACHE_DIR = BASE_DIR / "data" / "cache_polygon"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _read_cache(path: Path, max_age_hours: float) -> Optional[pd.DataFrame]:
+    """Return DataFrame from cache if younger than `max_age_hours`."""
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+
+    ts = payload.get("_cached_at")
+    if ts is None:
+        return None
+
+    cached_at = dt.datetime.fromisoformat(ts)
+    age = (dt.datetime.utcnow() - cached_at).total_seconds() / 3600.0
+    if age > max_age_hours:
+        return None
+
+    df = pd.DataFrame(payload.get("data", []))
+    if df.empty:
+        return None
+
+    # Restore timestamp index when present
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+
+    return df
+
+
+def _write_cache(path: Path, df: pd.DataFrame) -> None:
+    payload = {
+        "_cached_at": dt.datetime.utcnow().isoformat(),
+        "data": df.reset_index().to_dict(orient="records"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Underlying helpers (daily bars + realized volatility)
+# ---------------------------------------------------------------------------
 
 
 def get_underlying_bars(ticker: str, days: int = 60) -> pd.DataFrame:
     """
-    Fetch daily OHLCV price bars for an underlying ticker.
-    Returns a DataFrame indexed by timestamp.
+    Fetch daily bars for an underlying from Massive/Polygon and return
+    a tidy DataFrame indexed by timestamp with OHLCV columns.
+
+    We over-request a bit to account for weekends/holidays, then trim.
+    Results are cached on disk to avoid 429s.
     """
+    cache_path = CACHE_DIR / f"underlying_{ticker.upper()}_{days}d.json"
+    cached = _read_cache(cache_path, max_age_hours=4)
+    if cached is not None:
+        return cached
+
     client = _get_client()
 
-    end = datetime.utcnow().date()
-    start = end - timedelta(days=days + 5)
+    end_date = dt.date.today()
+    # Overfetch to absorb non-trading days
+    start_date = end_date - dt.timedelta(days=days * 3)
 
-    aggs = client.get_aggs(
-        ticker=ticker,
+    aggs_iter: Iterable[Any] = client.list_aggs(  # type: ignore[attr-defined]
+        ticker=ticker.upper(),
         multiplier=1,
         timespan="day",
-        from_=start.isoformat(),
-        to=end.isoformat(),
+        from_=start_date.isoformat(),
+        to=end_date.isoformat(),
+        limit=days * 3,
     )
 
-    if not aggs:
-        return pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    for agg in aggs_iter:
+        a = cast(Any, agg)
+        ts = getattr(a, "timestamp", None) or getattr(a, "t", None)
+        if isinstance(ts, (int, float)):
+            ts_dt = dt.datetime.fromtimestamp(ts / 1000.0, tz=dt.timezone.utc)
+        else:
+            ts_dt = ts
 
-    df = pd.DataFrame(aggs)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df = df.set_index("timestamp").sort_index()
-
-    return df.tail(days)[["open", "high", "low", "close", "volume"]]
-
-
-def get_underlying_last_price(ticker: str) -> float | None:
-    """Return the most recent close price from Polygon."""
-    df = get_underlying_bars(ticker, days=1)
-    if df.empty:
-        return None
-    return float(df["close"].iloc[-1])
-
-import numpy as np
-
-def realized_volatility_from_polygon(ticker: str, days: int = 20) -> float | None:
-    """
-    Compute annualized realized volatility using Polygon daily bars.
-    """
-    df = get_underlying_bars(ticker, days=days+1)
-    if df.empty or "close" not in df.columns:
-        return None
-
-    close = df["close"].dropna()
-    if len(close) < 2:
-        return None
-
-    returns = np.log(close / close.shift(1)).dropna()
-    if returns.empty:
-        return None
-
-    rv = np.sqrt(252) * returns.std()
-    return float(rv)
-
-# ---------------------------
-# Options chain helpers with caching
-# ---------------------------
-
-def _expirations_cache_path(ticker: str) -> Path:
-    return EXP_CACHE_DIR / f"{ticker.upper()}_expirations.csv"
-
-
-def _chain_cache_paths(ticker: str, expiration: str) -> Tuple[Path, Path]:
-    safe_exp = expiration.replace("-", "")
-    calls_path = CHAIN_CACHE_DIR / f"{ticker.upper()}_{safe_exp}_calls.csv"
-    puts_path = CHAIN_CACHE_DIR / f"{ticker.upper()}_{safe_exp}_puts.csv"
-    return calls_path, puts_path
-
-
-def list_option_expirations(
-    ticker: str,
-    use_cache_only: bool = False,
-) -> List[str]:
-    """
-    Return a sorted list of available (non-expired) option expirations
-    for a given underlying ticker using Polygon.
-
-    Caching behavior:
-      - If cache file exists, read & return it (no API call).
-      - If use_cache_only=True and no cache, return [].
-      - Else, call Polygon once, cache results to CSV, and return.
-    """
-    ticker = ticker.upper()
-    cache_path = _expirations_cache_path(ticker)
-
-    # 1) Try cache first
-    if cache_path.exists():
-        try:
-            df = pd.read_csv(cache_path)
-            exps = df["expiration"].astype(str).tolist()
-            if exps:
-                return sorted(set(exps))
-        except Exception as e:
-            print(f"[Polygon] expirations cache read error for {ticker}: {e}")
-
-    if use_cache_only:
-        # For portfolio/demo mode: never hit the API
-        return []
-
-    # 2) Fallback to live Polygon call + write cache
-    client = _get_client()
-    expirations = set()
-
-    try:
-        contracts = client.list_options_contracts(
-            underlying_ticker=ticker,
-            expired=False,
-            limit=1000,
+        rows.append(
+            {
+                "timestamp": ts_dt,
+                "open": getattr(a, "open", None),
+                "high": getattr(a, "high", None),
+                "low": getattr(a, "low", None),
+                "close": getattr(a, "close", None),
+                "volume": getattr(a, "volume", None),
+            }
         )
 
-        for c in contracts:
-            if getattr(c, "expiration_date", None):
-                expirations.add(c.expiration_date)
+    df = pd.DataFrame(rows).dropna(subset=["close"])
+    if df.empty:
+        return df
 
-        exps_list = sorted(expirations)
-        if exps_list:
-            df = pd.DataFrame({"expiration": exps_list})
-            df.to_csv(cache_path, index=False)
+    df.set_index("timestamp", inplace=True)
+    df.sort_index(inplace=True)
+    # Keep the last `days` trading days
+    df = df.tail(days)
 
-        return exps_list
+    _write_cache(cache_path, df)
+    return df
 
-    except Exception as e:
-        print(f"[Polygon] list_option_expirations error for {ticker}: {e}")
-        return []
+
+def get_underlying_last_price(ticker: str) -> float:
+    """
+    Get the latest trade price for an underlying.
+    Fallback: use the last close from daily bars if snapshot call fails.
+    """
+    client = _get_client()
+    try:
+        # Massive client uses `get_current_price`, older polygon client
+        # may only expose `get_last_trade`. We try both.
+        try:
+            price = client.get_current_price(ticker)  # type: ignore[attr-defined]
+            if isinstance(price, (int, float)):
+                return float(price)
+        except Exception:
+            trade = client.get_last_trade(ticker=ticker)  # type: ignore[arg-type]
+            val = getattr(trade, "price", None)
+            if isinstance(val, (int, float)):
+                return float(val)
+    except Exception:
+        pass
+
+    bars = get_underlying_bars(ticker, days=5)
+    if bars.empty:
+        raise RuntimeError(f"Could not fetch last price for {ticker}")
+    return float(bars["close"].iloc[-1])
+
+
+def compute_realized_vol(bars: pd.DataFrame, window: int = 20) -> float:
+    """
+    Compute annualized realized volatility from daily OHLCV bars.
+
+    Parameters
+    ----------
+    bars : DataFrame
+        Must contain a `close` column.
+    window : int
+        Rolling window in trading days.
+
+    Returns
+    -------
+    float
+        RV in percent (e.g. 25.3 == 25.3%).
+    """
+    if bars.empty or "close" not in bars.columns:
+        return float("nan")
+
+    # Make sure Pylance sees this as a Series, not a bare ndarray
+    closes = pd.Series(
+        pd.to_numeric(bars["close"], errors="coerce").dropna(),
+        dtype="float64",
+    )
+    if len(closes) < window:
+        return float("nan")
+
+    # Series -> Series, Pylance is now happy with .diff()
+    returns = np.log(closes).diff().dropna() # type: ignore
+    rolling_std = returns.rolling(window=window).std().dropna()
+    if rolling_std.empty:
+        return float("nan")
+
+    # Annualize: sqrt(252) * rolling std of daily log returns
+    rv = float(rolling_std.iloc[-1] * np.sqrt(252.0) * 100.0)
+    return rv
+
+
+
+# ---------------------------------------------------------------------------
+# Options helpers – expirations + simple chain snapshot
+# ---------------------------------------------------------------------------
+
+
+def list_option_expirations(ticker: str) -> List[str]:
+    """
+    Return a sorted list of unique expiration dates (YYYY-MM-DD) for the ticker.
+
+    We only call the API once per day per underlying and cache the result.
+    """
+    cache_path = CACHE_DIR / f"expirations_{ticker.upper()}.json"
+    cached = _read_cache(cache_path, max_age_hours=12)
+    if cached is not None:
+        return sorted(cached["expiration"].unique().tolist())
+
+    client = _get_client()
+    expirations: set[str] = set()
+
+    # We fetch contracts once as of today and collect their expirations.
+    today = dt.date.today()
+    contracts: Iterable[Any] = client.list_options_contracts(  # type: ignore[attr-defined]
+        underlying_ticker=ticker.upper(),
+        as_of=today.isoformat(),
+        limit=1000,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for c in contracts:
+        cc = cast(Any, c)
+        exp = getattr(cc, "expiration_date", None)
+        if isinstance(exp, dt.date):
+            exp_str = exp.isoformat()
+        else:
+            exp_str = str(exp) if exp is not None else None
+
+        if not exp_str:
+            continue
+
+        expirations.add(exp_str)
+        rows.append({"expiration": exp_str})
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        _write_cache(cache_path, df)
+
+    return sorted(expirations)
+
+
+def _build_chain_df(contracts: Iterable[Any]) -> pd.DataFrame:
+    """
+    Turn an iterable of option contract objects into a tidy DataFrame
+    with the fields we care about. Everything is treated as `Any`
+    so Pylance stays happy.
+    """
+    rows: List[Dict[str, Any]] = []
+    for c in contracts:
+        cc = cast(Any, c)
+        rows.append(
+            {
+                "ticker": getattr(cc, "ticker", None),
+                "underlying": getattr(cc, "underlying_ticker", None),
+                "expiration": getattr(cc, "expiration_date", None),
+                "contract_type": getattr(cc, "contract_type", None),
+                "strike_price": getattr(cc, "strike_price", None),
+                "exercise_style": getattr(cc, "exercise_style", None),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # Normalize expiration to string
+    df["expiration"] = df["expiration"].apply(
+        lambda x: x.isoformat() if isinstance(x, dt.date) else str(x)
+    )
+
+    return df
 
 
 def get_options_chain_for_expiration(
-    ticker: str,
-    expiration: str,
-    use_cache_only: bool = False,
+    ticker: str, expiration: str
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Fetch the full options chain (calls & puts) for a given underlying
-    and expiration date from Polygon.
-
-    Caching behavior:
-      - If cache files exist, read & return (no API call).
-      - If use_cache_only=True and cache missing, return empty DataFrames.
-      - Else, call Polygon once, cache calls/puts separately, and return.
+    Fetch a simple options chain for a given expiration and split into
+    calls / puts DataFrames.
     """
-    ticker = ticker.upper()
-    calls_path, puts_path = _chain_cache_paths(ticker, expiration)
+    cache_path = CACHE_DIR / f"chain_{ticker.upper()}_{expiration}.json"
+    cached = _read_cache(cache_path, max_age_hours=6)
+    if cached is not None:
+        calls = cached[cached["contract_type"] == "call"].copy()
+        puts = cached[cached["contract_type"] == "put"].copy()
+        return calls, puts
 
-    # 1) Try cache first
-    calls_df, puts_df = None, None
-    if calls_path.exists():
-        try:
-            calls_df = pd.read_csv(calls_path)
-        except Exception as e:
-            print(f"[Polygon] calls cache read error for {ticker} {expiration}: {e}")
-
-    if puts_path.exists():
-        try:
-            puts_df = pd.read_csv(puts_path)
-        except Exception as e:
-            print(f"[Polygon] puts cache read error for {ticker} {expiration}: {e}")
-
-    if calls_df is not None and puts_df is not None:
-        return calls_df, puts_df
-
-    if use_cache_only:
-        # In demo mode, don't ever hit the API
-        return pd.DataFrame(), pd.DataFrame()
-
-    # 2) Fallback to live Polygon call + write cache
     client = _get_client()
-    rows = []
 
-    try:
-        contracts = client.list_options_contracts(
-            underlying_ticker=ticker,
-            expiration_date=expiration,
-            expired=False,
-            limit=1000,
+    contracts: Iterable[Any] = client.list_options_contracts(  # type: ignore[attr-defined]
+        underlying_ticker=ticker.upper(),
+        expiration_date=dt.datetime.strptime(expiration, "%Y-%m-%d").date(),
+        as_of=dt.date.today().isoformat(),
+        limit=2000,
+    )
+
+    df = _build_chain_df(contracts)
+    if df.empty:
+        empty = pd.DataFrame(
+            columns=["ticker", "underlying", "expiration", "contract_type", "strike_price", "exercise_style"]
         )
+        return empty.copy(), empty.copy()
 
-        for c in contracts:
-            greeks = getattr(c, "greeks", None)
+    _write_cache(cache_path, df)
 
-            rows.append(
-                {
-                    "symbol": c.ticker,
-                    "type": c.contract_type,  # "call" or "put"
-                    "strike": float(c.strike_price) if c.strike_price is not None else np.nan,
-                    "expiration": c.expiration_date,
-                    "bid": getattr(c, "bid_price", np.nan),
-                    "ask": getattr(c, "ask_price", np.nan),
-                    "mid": (
-                        (getattr(c, "bid_price", np.nan) + getattr(c, "ask_price", np.nan)) / 2
-                        if getattr(c, "bid_price", None) is not None
-                        and getattr(c, "ask_price", None) is not None
-                        else np.nan
-                    ),
-                    "last_trade_price": getattr(c, "last_trade_price", np.nan),
-                    "volume": getattr(c, "trade_volume", np.nan),
-                    "open_interest": getattr(c, "open_interest", np.nan),
-                    "delta": getattr(greeks, "delta", np.nan) if greeks else np.nan,
-                    "gamma": getattr(greeks, "gamma", np.nan) if greeks else np.nan,
-                    "theta": getattr(greeks, "theta", np.nan) if greeks else np.nan,
-                    "vega": getattr(greeks, "vega", np.nan) if greeks else np.nan,
-                    "rho": getattr(greeks, "rho", np.nan) if greeks else np.nan,
-                    "iv": getattr(greeks, "iv", np.nan) if greeks else np.nan,
-                }
-            )
-
-    except Exception as e:
-        print(f"[Polygon] get_options_chain_for_expiration error for {ticker} {expiration}: {e}")
-        return pd.DataFrame(), pd.DataFrame()
-
-    if not rows:
-        return pd.DataFrame(), pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    calls_df = df[df["type"] == "call"].reset_index(drop=True)
-    puts_df = df[df["type"] == "put"].reset_index(drop=True)
-
-    # Cache them for future / demo use
-    try:
-        calls_df.to_csv(calls_path, index=False)
-        puts_df.to_csv(puts_path, index=False)
-    except Exception as e:
-        print(f"[Polygon] error writing chain cache for {ticker} {expiration}: {e}")
-
-    return calls_df, puts_df
+    calls = df[df["contract_type"] == "call"].copy()
+    puts = df[df["contract_type"] == "put"].copy()
+    return calls, puts
 
 
 def get_nearest_expiration_chain(
     ticker: str,
-    use_cache_only: bool = False,
 ) -> Tuple[Optional[str], pd.DataFrame, pd.DataFrame]:
     """
     Convenience helper:
-      - finds the nearest (earliest) non-expired expiration
-      - returns expiration string, calls_df, puts_df
+    - find the nearest *future* expiration
+    - fetch the options chain for that expiry
     """
-    expirations = list_option_expirations(ticker, use_cache_only=use_cache_only)
+    expirations = list_option_expirations(ticker)
     if not expirations:
         return None, pd.DataFrame(), pd.DataFrame()
 
-    nearest = expirations[0]
-    calls, puts = get_options_chain_for_expiration(
-        ticker, nearest, use_cache_only=use_cache_only
-        )
-    return nearest, calls, puts
+    today = dt.date.today()
+
+    def _parse(d: str) -> dt.date:
+        return dt.datetime.strptime(d, "%Y-%m-%d").date()
+
+    future_exps = [e for e in expirations if _parse(e) >= today]
+    if not future_exps:
+        exp = expirations[0]
+    else:
+        future_exps.sort(key=_parse)
+        exp = future_exps[0]
+
+    calls, puts = get_options_chain_for_expiration(ticker, exp)
+    return exp, calls, puts

@@ -25,6 +25,8 @@ data/raw/
 data/processed/
 *.csv
 *.parquet
+data/cache_polygon/
+
 
 # OS
 .DS_Store
