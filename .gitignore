@@ -21,12 +21,22 @@ env/
 .streamlit/
 
 # Data
+data
 data/raw/
 data/processed/
 *.csv
 *.parquet
 data/cache_polygon/
 
+# DuckDB / local databases
+data/*.duckdb
+data/*.db
+data/volatility_alpha.duckdb
+
+# Raw / intermediate data (general pattern)
+data/raw/
+data/tmp/
+data/cache/
 
 # OS
 .DS_Store

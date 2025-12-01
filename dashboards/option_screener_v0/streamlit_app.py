@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 from openai import OpenAI
+import plotly.express as px
 
 # ----------------------------------------------------------------
 # Make project root importable so we can do "from src..."
@@ -19,10 +20,20 @@ PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# ----------------------------------------------------------------
+# Now safe to import from src/*
+# ----------------------------------------------------------------
+from src.db_duckdb import (
+    ensure_schema,
+    upsert_screener_snapshot,
+    get_scanner_view_for_date,
+)
+
 from src.polygon_client import (  # type: ignore  # noqa: E402
     compute_realized_vol,
     get_underlying_bars,
 )
+
 
 # ----------------------------------------------------------------
 # Streamlit page config
@@ -49,6 +60,31 @@ This is your **daily volatility radar**:
 # ----------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------
+
+def _infer_playbook_row(row: pd.Series) -> str:
+    """
+    Very simple rule-based mapping from metrics to strategy type.
+    This is v1; we'll refine later.
+    """
+    iv_rank = row.get("rv_20d", None)  # using RV as IV proxy for now
+    day_pct = row.get("day_pct", None)
+
+    if iv_rank is None or pd.isna(iv_rank):
+        return "Insufficient data – monitor only."
+
+    # You can tune thresholds later
+    high_vol = iv_rank >= 60
+    huge_move = abs(day_pct) >= 3 if day_pct is not None and not pd.isna(day_pct) else False
+    trendish = abs(day_pct) >= 1.5 # type: ignore
+
+    if high_vol and not huge_move:
+        return "Best suited for credit spreads / iron condors (elevated vol, non-crazy move)."
+    if high_vol and huge_move:
+        return "Possible volatility harvest after a big move – consider defined-risk spreads only."
+    if trendish and not high_vol:
+        return "Best suited for directional plays or debit spreads (trend with moderate vol)."
+
+    return "No strong edge – keep this on a watchlist and size smaller."
 
 
 def _parse_ticker_input(raw: str) -> List[str]:
@@ -349,6 +385,11 @@ if raw_df.empty:
     st.error("No data returned for the given tickers.")
     st.stop()
 
+# --- Persist results for this run into DuckDB ---
+ensure_schema()
+upsert_screener_snapshot(raw_df)
+
+
 # ---------------- KPI cards row ----------------
 total_names = len(raw_df)
 
@@ -471,10 +512,25 @@ with chart_col2:
         )
         st.altair_chart(bar, width="stretch")
 
+# ---------------- Playbook card ----------------
+st.markdown("### Playbook – Strategy Fit by Ticker")
+
+selected_ticker = st.selectbox(
+    "Choose a ticker for today's playbook:",
+    options=raw_df["ticker"].unique().tolist(),
+)
+
+selected_row = raw_df[raw_df["ticker"] == selected_ticker].iloc[0]
+playbook_text = _infer_playbook_row(selected_row)
+
+st.info(f"**{selected_ticker} – {playbook_text}**", icon="🎯")
+
+
 # ---------------- Explainer ----------------
 st.markdown("### Big Picture")
 insights_df = styled.data if hasattr(styled, "data") else raw_df  # type: ignore[attr-defined]
-st.write(generate_ai_insights(insights_df.rename(columns=str)))
+with st.expander("AI summary of today's volatility setup", expanded=False):
+    st.write(generate_ai_insights(insights_df.rename(columns=str)))
 
 st.markdown(
     """
@@ -492,3 +548,4 @@ Next versions will add:
 - Export / notebook links and strategy suggestions
 """
 )
+
