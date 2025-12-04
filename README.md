@@ -11,6 +11,7 @@ This repo is the **research backend** for a future Streamlit dashboard and RL op
 
 ## Project Structure
 
+```text
 volatility-alpha-engine/
 ├── data/
 │   └── volatility_alpha.duckdb      # DuckDB file with all engineered tables
@@ -28,6 +29,8 @@ volatility-alpha-engine/
 ├── .env
 ├── requirements.txt
 └── README.md
+```
+---
 
 **Notebooks Overview**
 
