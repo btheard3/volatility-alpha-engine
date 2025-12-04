@@ -116,19 +116,21 @@ source .venv/bin/activate         # Linux/WSL
 ```
 
 **2. Install dependencies**
-
+```
 pip install -r requirements.txt
+```
 
 **3. Ensure DuckDB file is present**
 
 Place the DuckDB database at:
-
+```
 data/volatility_alpha.duckdb
+```
 (Notebook paths assume this location.)
 
 Run the notebooks in order
 
-Recommended order:
+**Recommended order**:
 
 1. `00_backfill.ipynb`
 
