@@ -109,9 +109,11 @@ Planned extensions:
 
 **1. Create and activate a virtual environment**
 
+```
 python -m venv .venv
 source .venv/bin/activate         # Linux/WSL
 # .venv\Scripts\activate          # Windows
+```
 
 **2. Install dependencies**
 
