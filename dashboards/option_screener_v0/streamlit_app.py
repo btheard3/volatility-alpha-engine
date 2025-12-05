@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations 
 
 import os
 import sys
@@ -57,6 +57,41 @@ st.markdown(
         font-weight: 600;
     }
     </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Top-right personal badge (GitHub + LinkedIn)
+st.markdown(
+    """
+    <style>
+    .vae-top-links {
+        position: fixed;
+        top: 12px;
+        right: 18px;
+        font-size: 13px;
+        z-index: 999;
+        background: rgba(15, 23, 42, 0.85);
+        padding: 4px 10px;
+        border-radius: 999px;
+        backdrop-filter: blur(6px);
+    }
+    .vae-top-links a {
+        color: #9ca3af;
+        text-decoration: none;
+        margin-left: 6px;
+        margin-right: 6px;
+    }
+    .vae-top-links a:hover {
+        color: #e5e7eb;
+        text-decoration: underline;
+    }
+    </style>
+    <div class="vae-top-links">
+        <span style="opacity:0.7;">Built by Brandon Theard ·</span>
+        <a href="https://github.com/btheard3/volatility-alpha-engine" target="_blank">GitHub</a>|
+        <a href="https://www.linkedin.com/in/brandon-theard-811b38131" target="_blank">LinkedIn</a>
+    </div>
     """,
     unsafe_allow_html=True,
 )
@@ -233,11 +268,11 @@ with title_col:
     st.title("Volatility Alpha Engine – Option Screener V1 (Polygon RV)")
 
     st.success(
-    "This is a daily volatility screener that ranks tickers by a "
-    "composite edge score and highlights where a simple RL-style policy would prefer "
-    "to take risk.",
-    icon="✅",
-)
+        "This is a daily volatility screener that ranks tickers by a "
+        "composite edge score and highlights where a simple RL-style policy would "
+        "prefer to take risk.",
+        icon="✅",
+    )
 
     st.markdown(
         """
@@ -410,6 +445,7 @@ def _styled_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 
     return styler
 
+
 def classify_vol_env(avg_rv20: float) -> tuple[str, str]:
     """
     Turn average 20d realized volatility into a simple regime label + explanation.
@@ -435,6 +471,7 @@ def classify_vol_env(avg_rv20: float) -> tuple[str, str]:
         "Hot",
         "Tape is whippy. Expect bigger swings and favour defined-risk structures.",
     )
+
 
 def _classify_vol_env(avg_rv20: float) -> str:
     if np.isnan(avg_rv20):
@@ -693,7 +730,7 @@ with col3:
 with col4:
     if biggest_move_row is not None:
         st.metric(
-            "Biggest Mover (Day %)",
+            "Biggest Mover (Day %) ",
             f"{biggest_move_row['day_pct']:+.2f}%",
             help=f"{biggest_move_row['ticker']}",
         )
@@ -739,9 +776,9 @@ st.markdown("---")
 # ---------------------------------------------------------------------
 st.markdown("### Volatility & Edge Overview")
 st.caption(
-    "Chart 1 (left) shows **20d realized volatility vs Daily Edge Score**. "
+    "Chart 1 shows **20d realized volatility vs Daily Edge Score**. "
     "Top-right dots are your highest-energy setups today. "
-    "Chart 2 (right) ranks the top 5 names by edge."
+    "Chart 2 ranks the universe by edge."
 )
 
 chart_data = raw_df.replace([np.inf, -np.inf], np.nan).dropna(
@@ -846,6 +883,22 @@ playbook_text = _infer_playbook_row(selected_row)
 
 st.info(f"**{selected_ticker} – {playbook_text}**", icon="🎯")
 
+# ---- Quick Trade Ideas (Top 3 by Edge Score) ----
+st.markdown("#### Quick Trade Ideas (Top 3 by Edge Score)")
+
+ranked = raw_df.sort_values("edge_score", ascending=False).head(3)
+for row in ranked.itertuples():
+    vol_label = _classify_vol_env(float(row.rv_20d))
+    idea_text = _infer_playbook_row(pd.Series(row._asdict()))
+    st.markdown(
+        f"""
+**{row.ticker}**  
+- Volatility: {vol_label}  
+- Edge Score: **{row.edge_score:.2f}%**  
+- Idea: {idea_text}
+"""
+    )
+
 st.markdown("---")
 
 # ---------------------------------------------------------------------
@@ -937,4 +990,3 @@ st.caption(
     "Contact: [LinkedIn](https://www.linkedin.com/in/brandon-theard-811b38131)"
 )
 # ---------------------------------------------------------------------
-
