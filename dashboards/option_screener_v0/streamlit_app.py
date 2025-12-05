@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import altair as alt
 import numpy as np
@@ -10,81 +10,117 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 from openai import OpenAI
-import plotly.express as px
+from datetime import datetime
 
-# ----------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Make project root importable so we can do "from src..."
-# ----------------------------------------------------------------
+# (Assumes this file lives in dashboards/option_screener_v1/)
+# ---------------------------------------------------------------------
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# ----------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Now safe to import from src/*
-# ----------------------------------------------------------------
+# ---------------------------------------------------------------------
 from src.db_duckdb import (
     ensure_schema,
     upsert_screener_snapshot,
-    get_scanner_view_for_date,
 )
-
 from src.polygon_client import (  # type: ignore  # noqa: E402
     compute_realized_vol,
     get_underlying_bars,
 )
 
-
-# ----------------------------------------------------------------
-# Streamlit page config
-# ----------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Streamlit page config + light CSS polish
+# ---------------------------------------------------------------------
 st.set_page_config(
     page_title="Volatility Alpha Engine – Option Screener V1",
     layout="wide",
 )
 
-st.title("Volatility Alpha Engine – Option Screener V1 (Polygon RV)")
+# Center the main column and narrow it for a “phone scroll” feel
 st.markdown(
     """
-V1: Screener with Polygon-based realized volatility and a simple Daily Edge Score.
-
-This is your **daily volatility radar**:
-
-- You type in a list of tickers  
-- We pull price/volume with `yfinance` and realized vol from **Polygon**  
-- We compute a simple Daily Edge Score  
-- We rank names by that edge score
-"""
+    <style>
+    .block-container {
+        max-width: 960px;
+        padding-top: 1.5rem;
+        padding-bottom: 4rem;
+        margin: auto;
+    }
+    /* Make metrics slightly bolder / bigger */
+    [data-testid="stMetricValue"] {
+        font-size: 1.4rem;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-# ----------------------------------------------------------------
-# Helpers
-# ----------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Sidebar – inputs, presets, and "Run Screener" button
+# ---------------------------------------------------------------------
+st.sidebar.header("Screener Settings")
 
-def _infer_playbook_row(row: pd.Series) -> str:
-    """
-    Very simple rule-based mapping from metrics to strategy type.
-    This is v1; we'll refine later.
-    """
-    iv_rank = row.get("rv_20d", None)  # using RV as IV proxy for now
-    day_pct = row.get("day_pct", None)
+# Simple session flags
+if "has_run" not in st.session_state:
+    st.session_state["has_run"] = False
+if "last_run_ts" not in st.session_state:
+    st.session_state["last_run_ts"] = None
 
-    if iv_rank is None or pd.isna(iv_rank):
-        return "Insufficient data – monitor only."
+recruiter_mode = st.sidebar.checkbox(
+    "Recruiter / Demo Mode",
+    value=False,
+    help=(
+        "Uses a fixed demo basket so you can show the app without worrying "
+        "about bad ticker input or API hiccups mid-demo."
+    ),
+)
 
-    # You can tune thresholds later
-    high_vol = iv_rank >= 60
-    huge_move = abs(day_pct) >= 3 if day_pct is not None and not pd.isna(day_pct) else False
-    trendish = abs(day_pct) >= 1.5 # type: ignore
+# Preset baskets
+PRESET_BASKETS = {
+    "Index & Tech (default)": ["SPY", "QQQ", "AMD", "TSLA"],
+    "Mega-Cap Tech": ["AAPL", "MSFT", "META", "GOOGL", "NVDA"],
+    "Volatility Watchlist": ["TSLA", "NVDA", "AMD", "SMCI", "COIN"],
+    "S&P Sectors Mix": ["SPY", "XLF", "XLE", "XLY", "XLK"],
+    "Custom only": [],
+}
 
-    if high_vol and not huge_move:
-        return "Best suited for credit spreads / iron condors (elevated vol, non-crazy move)."
-    if high_vol and huge_move:
-        return "Possible volatility harvest after a big move – consider defined-risk spreads only."
-    if trendish and not high_vol:
-        return "Best suited for directional plays or debit spreads (trend with moderate vol)."
+preset_label = st.sidebar.selectbox(
+    "Preset basket",
+    options=list(PRESET_BASKETS.keys()),
+    index=0,
+    help="Quick starting baskets for different use cases.",
+)
 
-    return "No strong edge – keep this on a watchlist and size smaller."
+# Common names list for multi-select
+COMMON_NAMES = sorted(
+    list(
+        {
+            *PRESET_BASKETS["Index & Tech (default)"],
+            *PRESET_BASKETS["Mega-Cap Tech"],
+            *PRESET_BASKETS["Volatility Watchlist"],
+            *PRESET_BASKETS["S&P Sectors Mix"],
+        }
+    )
+)
+
+selected_from_list = st.sidebar.multiselect(
+    "Pick from popular names",
+    options=COMMON_NAMES,
+    default=PRESET_BASKETS["Index & Tech (default)"],
+    help="Layer on top of the preset basket or build your own mini-universe.",
+)
+
+extra_raw = st.sidebar.text_input(
+    "Extra tickers (comma-separated)",
+    value="",
+    help="Add any other stocks here, e.g. SMCI, COIN.",
+)
 
 
 def _parse_ticker_input(raw: str) -> List[str]:
@@ -93,7 +129,6 @@ def _parse_ticker_input(raw: str) -> List[str]:
         return []
     parts = [p.strip().upper() for p in raw.replace("\n", ",").split(",")]
     tickers = [p for p in parts if p]
-    # keep order but drop duplicates
     seen: set[str] = set()
     ordered: List[str] = []
     for t in tickers:
@@ -103,12 +138,137 @@ def _parse_ticker_input(raw: str) -> List[str]:
     return ordered
 
 
+st.sidebar.markdown(
+    """
+Tip: Start with index ETFs + high-beta names to see where the action is.
+"""
+)
+
+run_clicked = st.sidebar.button("Run Screener", type="primary")
+
+# ---------------------------------------------------------------------
+# Build final ticker list based on mode & inputs
+# ---------------------------------------------------------------------
+if recruiter_mode:
+    # Ignore sidebar selections and use a fixed, safe basket
+    base = PRESET_BASKETS["Index & Tech (default)"]
+    tickers = list(base)
+else:
+    base = PRESET_BASKETS[preset_label]
+    tickers: List[str] = list(base)
+
+    # layer in multi-select names
+    for t in selected_from_list:
+        if t not in tickers:
+            tickers.append(t)
+
+    # layer in extra text input names
+    extras = _parse_ticker_input(extra_raw)
+    for t in extras:
+        if t not in tickers:
+            tickers.append(t)
+
+# Show how many names will be scanned
+st.sidebar.caption(f"📊 You’ll screen **{len(tickers)}** ticker(s) on the next run.")
+
+# Update session flag / timestamp when the button is clicked
+if run_clicked:
+    st.session_state["has_run"] = True
+    st.session_state["last_run_ts"] = datetime.now()
+
+# Tiny API/status footer
+if st.session_state["last_run_ts"] is not None:
+    ts = st.session_state["last_run_ts"].strftime("%Y-%m-%d %H:%M")
+    st.sidebar.caption(f"✅ Last run: {ts} (local time)")
+else:
+    st.sidebar.caption("⏱️ No runs yet this session.")
+
+# ---------------------------------------------------------------------
+# Early exits & welcome state
+# ---------------------------------------------------------------------
+if not st.session_state["has_run"]:
+    st.subheader("Welcome – get today’s volatility snapshot in 3 quick steps")
+
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        st.markdown(
+            """
+**1. Choose a basket**  
+Pick a preset (e.g. *Index & Tech*) and layer in a few favourites.
+"""
+        )
+    with col_b:
+        st.markdown(
+            """
+**2. Add any extras**  
+Type tickers into **Extra tickers** if they aren’t in the list.
+"""
+        )
+    with col_c:
+        st.markdown(
+            """
+**3. Run Screener**  
+Click **Run Screener** to pull prices, realized vol, and edge scores.
+"""
+        )
+
+    st.info(
+        "Once you run the screener, you’ll see rankings, charts, and trade ideas "
+        "based on today’s moves and volatility.",
+        icon="✨",
+    )
+    st.stop()
+
+if not tickers:
+    st.info("No tickers selected. Add at least one ticker in the sidebar.", icon="⚠️")
+    st.stop()
+
+# ---------------------------------------------------------------------
+# Page header
+# ---------------------------------------------------------------------
+title_col, badge_col = st.columns([0.85, 0.15])
+
+with title_col:
+    st.title("Volatility Alpha Engine – Option Screener V1 (Polygon RV)")
+
+    st.success(
+    "This is a daily volatility screener that ranks tickers by a "
+    "composite edge score and highlights where a simple RL-style policy would prefer "
+    "to take risk.",
+    icon="✅",
+)
+
+    st.markdown(
+        """
+V1 screener with Polygon-based realized volatility and a simple Daily Edge Score.
+
+This is your **daily volatility radar**:
+
+- You type in a list of tickers  
+- We pull price/volume with `yfinance` and realized vol from **Polygon**  
+- We compute a simple **Daily Edge Score**  
+- We rank names by that edge score
+"""
+    )
+
+with badge_col:
+    if recruiter_mode:
+        st.markdown(
+            "<div style='margin-top:1rem; padding:0.4rem 0.8rem; "
+            "border-radius:999px; background-color:#1d4ed8; color:white; "
+            "font-size:0.8rem; text-align:center;'>Demo Mode</div>",
+            unsafe_allow_html=True,
+        )
+
+# ---------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------
 def _fetch_ticker_row(symbol: str) -> Dict[str, Any]:
     """
     Fetch metrics for one underlying:
     - Always returns price / day % / volume from yfinance
     - Tries Polygon for RV 20d / 60d (soft-fail)
-    - Nearest expiration currently disabled (to avoid 429 spam)
     """
     symbol = symbol.upper()
 
@@ -127,7 +287,7 @@ def _fetch_ticker_row(symbol: str) -> Dict[str, Any]:
     # --- 2. Defaults for Polygon fields ---
     rv_20d: float = float("nan")
     rv_60d: float = float("nan")
-    nearest_exp: str | None = None
+    nearest_exp: Optional[str] = None
 
     # --- 3. Polygon realized vol (soft-fail) ---
     try:
@@ -137,15 +297,7 @@ def _fetch_ticker_row(symbol: str) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         print(f"[WARN] RV failed for {symbol}: {e!r}")
 
-    # --- 4. Nearest expiration / chain (temporarily disabled) ---
-    # TODO: Re-enable when we add a “click to load options chain” UI
-    # try:
-    #     exp, calls, puts = get_nearest_expiration_chain(symbol)
-    #     nearest_exp = exp
-    # except Exception as e:
-    #     print(f"[WARN] chain failed for {symbol}: {e!r}")
-
-    # --- 5. Simple edge score V1 ---
+    # --- 4. Simple edge score V1 ---
     components: list[float] = [abs(day_pct)]
     if not np.isnan(rv_20d):
         components.append(rv_20d)
@@ -258,16 +410,99 @@ def _styled_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 
     return styler
 
+def classify_vol_env(avg_rv20: float) -> tuple[str, str]:
+    """
+    Turn average 20d realized volatility into a simple regime label + explanation.
 
-def generate_ai_insights(df: pd.DataFrame) -> str:
+    This is used in the 'Today at a Glance' card so a non-quant can follow the story.
+    """
+    if np.isnan(avg_rv20):
+        return "Unknown", "We don’t have enough volatility data yet."
+
+    if avg_rv20 < 15:
+        return (
+            "Calm",
+            "Index-style moves. Edges mostly come from single-name gaps rather than broad chaos.",
+        )
+
+    if avg_rv20 < 25:
+        return (
+            "Normal",
+            "Typical tape. There’s movement, but nothing out of control.",
+        )
+
+    return (
+        "Hot",
+        "Tape is whippy. Expect bigger swings and favour defined-risk structures.",
+    )
+
+def _classify_vol_env(avg_rv20: float) -> str:
+    if np.isnan(avg_rv20):
+        return "Unknown"
+    if avg_rv20 < 12:
+        return "Calm"
+    if avg_rv20 < 25:
+        return "Normal"
+    return "Hot"
+
+
+def _generate_today_brief(
+    total_names: int,
+    avg_rv20: float,
+    max_edge_row: Optional[pd.Series],
+    biggest_move_row: Optional[pd.Series],
+) -> str:
+    env = _classify_vol_env(avg_rv20)
+    parts: List[str] = []
+
+    # Vol environment
+    if env == "Calm":
+        parts.append(
+            "Volatility is **calm** overall. Expect smaller daily swings and slower setups."
+        )
+    elif env == "Normal":
+        parts.append(
+            "Volatility is in a **normal** range. Moves are tradable but not extreme."
+        )
+    elif env == "Hot":
+        parts.append(
+            "Volatility is **hot**. Expect bigger swings and whippier moves across this basket."
+        )
+    else:
+        parts.append(
+            "Volatility environment is unclear due to limited data, so position size carefully."
+        )
+
+    # Edge / best idea
+    if max_edge_row is not None and not np.isnan(max_edge_row["edge_score"]):
+        parts.append(
+            f"**Top edge name:** {max_edge_row['ticker']} "
+            f"with a Daily Edge Score around {max_edge_row['edge_score']:.1f}%."
+        )
+
+    # Biggest mover
+    if biggest_move_row is not None and not np.isnan(biggest_move_row["day_pct"]):
+        direction = "up" if biggest_move_row["day_pct"] > 0 else "down"
+        parts.append(
+            f"**Biggest mover:** {biggest_move_row['ticker']} at "
+            f"{biggest_move_row['day_pct']:+.2f}% on the day ({direction})."
+        )
+
+    # Portfolio size note
+    parts.append(
+        f"This scan covers **{total_names} names**. Treat this as a radar, not a trade recommendation."
+    )
+
+    return " ".join(parts)
+
+
+def generate_ai_insights(df_for_ai: pd.DataFrame) -> str:
     """
     Take the ranking dataframe and return a human-friendly, hybrid
     (professional + beginner-friendly) explanation of today's volatility.
     """
-
     api_key = os.getenv("OPENAI_API_KEY")
 
-    # If no key, keep the app from crashing
     if not api_key:
         return (
             "AI insights are disabled. Add `OPENAI_API_KEY` to your `.env` file "
@@ -276,16 +511,7 @@ def generate_ai_insights(df: pd.DataFrame) -> str:
 
     client = OpenAI(api_key=api_key)
 
-    cols_for_ai = [
-        "Ticker",
-        "Last Price",
-        "Day %",
-        "Volume",
-        "RV 20d",
-        "RV 60d",
-        "Daily Edge Score",
-    ]
-    table = df[cols_for_ai].copy()
+    table = df_for_ai.copy()
     csv_snapshot = table.to_csv(index=False)
 
     prompt = f"""
@@ -312,17 +538,8 @@ Write a concise explanation with a **hybrid tone**:
 Follow this structure:
 
 1. **Big Picture (2–3 sentences)**
-   - What does volatility look like across these names today?
-   - Is the overall environment quiet, moderate, or hot?
-
-2. **Watchlist Ideas (3–5 bullet points)**
-   - For each bullet, name the ticker and explain *why* it stands out
-     (e.g., high Daily Edge Score, big Day %, unusual RV20 vs RV60, etc.)
-   - Keep each bullet to 1–2 sentences max.
-
+2. **Watchlist Ideas (3–5 bullets)**
 3. **Risk & Context (2–3 short bullets)**
-   - Mention things like: “these are volatile names”, “position size carefully”,
-     or “broad market may be calm but single-name risk is high.”
 
 Guidelines:
 - Use plain language, no formulas.
@@ -353,44 +570,65 @@ Guidelines:
         )
 
 
-# ----------------------------------------------------------------
-# Sidebar – input
-# ----------------------------------------------------------------
-
-st.sidebar.header("Screener Settings")
-raw_tickers = st.sidebar.text_input(
-    "Tickers (comma-separated)",
-    value="SPY, QQQ, TSLA, NVDA, AMD",
-    help="Enter stock tickers separated by commas.",
-)
-
-st.sidebar.markdown(
+def _infer_playbook_row(row: pd.Series) -> str:
     """
-Tip: Start with index ETFs + high-beta names to see where the action is.
-"""
-)
+    Very simple rule-based mapping from metrics to strategy type.
+    This is v1; we'll refine later.
+    """
+    iv_proxy = row.get("rv_20d", None)
+    day_pct = row.get("day_pct", None)
 
-tickers = _parse_ticker_input(raw_tickers)
+    if iv_proxy is None or pd.isna(iv_proxy):
+        return "Insufficient data – monitor only for now."
 
-# ----------------------------------------------------------------
-# Main content
-# ----------------------------------------------------------------
+    high_vol = iv_proxy >= 60
+    huge_move = (
+        abs(day_pct) >= 3
+        if (day_pct is not None and not pd.isna(day_pct))
+        else False
+    )
+    trendish = (
+        abs(day_pct) >= 1.5
+        if (day_pct is not None and not pd.isna(day_pct))
+        else False
+    )
 
+    if high_vol and not huge_move:
+        return "Best suited for credit spreads / iron condors (elevated vol, non-crazy move)."
+    if high_vol and huge_move:
+        return "Possible volatility harvest after a big move – stick to defined-risk spreads."
+    if trendish and not high_vol:
+        return "Best suited for directional plays or debit spreads (trend with moderate vol)."
+
+    return "No strong edge – keep this on a watchlist and size smaller."
+
+
+# ---------------------------------------------------------------------
+# Early exits if no tickers
+# ---------------------------------------------------------------------
 if not tickers:
     st.info("Add at least one ticker in the sidebar to run the screener.")
     st.stop()
 
+# Universe summary strip
+st.caption(
+    f"Universe: **{preset_label}** · {len(tickers)} name(s) · "
+    f"{'Demo snapshot (Recruiter / Demo Mode)' if recruiter_mode else 'Live data from yfinance + Polygon'}"
+)
+
+# ---------------------------------------------------------------------
+# Run screener
+# ---------------------------------------------------------------------
 raw_df = _build_screener_table(tickers)
 if raw_df.empty:
     st.error("No data returned for the given tickers.")
     st.stop()
 
-# --- Persist results for this run into DuckDB ---
+# Persist results for this run into DuckDB
 ensure_schema()
 upsert_screener_snapshot(raw_df)
 
-
-# ---------------- KPI cards row ----------------
+# ---------------- KPI row + narrative "Today at a Glance" ----------------
 total_names = len(raw_df)
 
 valid_edge = raw_df["edge_score"].replace([np.inf, -np.inf], np.nan)
@@ -406,10 +644,35 @@ if valid_day_pct.dropna().empty:
 else:
     biggest_move_row = raw_df.loc[valid_day_pct.abs().idxmax()]
 
+env_label, env_explainer = classify_vol_env(avg_rv20)
+
+top_edge_name = (
+    f"{max_edge_row['ticker']} with Daily Edge Score ≈ {max_edge:.2f}%"
+    if max_edge_row is not None
+    else "None – no usable edge scores yet."
+)
+
+biggest_move_text = (
+    f"{biggest_move_row['ticker']} at {biggest_move_row['day_pct']:+.2f}% on the day"
+    if biggest_move_row is not None
+    else "No clear standout move yet."
+)
+
+st.markdown("### Today at a Glance")
+
+st.info(
+    f"**Environment:** {env_label}. {env_explainer}\n\n"
+    f"- **Universe size:** {total_names} name(s) in the *{preset_label}* basket.\n"
+    f"- **Top edge name:** {top_edge_name}.\n"
+    f"- **Biggest mover:** {biggest_move_text}.",
+    icon="📊",
+)
+
+# Compact KPI strip under the narrative card
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    st.metric("Names Scanned", f"{total_names}")
+    st.metric("Names Screened", f"{total_names}")
 
 with col2:
     if max_edge_row is not None:
@@ -423,9 +686,9 @@ with col2:
 
 with col3:
     if not np.isnan(avg_rv20):
-        st.metric("Avg RV 20d", f"{avg_rv20:.2f}%")
+        st.metric("Avg 20d RV", f"{avg_rv20:.2f}%")
     else:
-        st.metric("Avg RV 20d", "None")
+        st.metric("Avg 20d RV", "None")
 
 with col4:
     if biggest_move_row is not None:
@@ -439,84 +702,142 @@ with col4:
 
 st.markdown("---")
 
-# ---------------- Screener table ----------------
-st.subheader("Daily Edge Ranking (V1 – Polygon RV)")
+# ---------------- Table & charts intro ----------------
+st.subheader("Daily Edge Ranking")
+
+st.caption(
+    "Names are sorted by **Daily Edge Score** – start at the top when you’re "
+    "looking for ideas or walking a recruiter through the dashboard."
+)
+
+# ---------------------------------------------------------------------
+# Screener table
+# ---------------------------------------------------------------------
+st.markdown(
+    """
+Each row is a ticker in your basket.  
+Higher **Daily Edge Score** = more interesting today (bigger move and/or higher realized volatility).
+"""
+)
 
 styled = _styled_table(raw_df)
-st.dataframe(styled, width="stretch")
+st.dataframe(styled, use_container_width=True)
 
-# ---------------- Charts row ----------------
+csv_download = raw_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="Download today’s screener results (CSV)",
+    data=csv_download,
+    file_name="vae_screener_snapshot.csv",
+    mime="text/csv",
+    help="Save this slice for notebooks, Excel, or further analysis.",
+)
+
+st.markdown("---")
+
+# ---------------------------------------------------------------------
+# Volatility & Edge charts (stacked, not side-by-side)
+# ---------------------------------------------------------------------
 st.markdown("### Volatility & Edge Overview")
+st.caption(
+    "Chart 1 (left) shows **20d realized volatility vs Daily Edge Score**. "
+    "Top-right dots are your highest-energy setups today. "
+    "Chart 2 (right) ranks the top 5 names by edge."
+)
 
-chart_col1, chart_col2 = st.columns(2)
+chart_data = raw_df.replace([np.inf, -np.inf], np.nan).dropna(
+    subset=["rv_20d", "edge_score"]
+)
 
-# Scatter: RV 20d vs Edge Score
-with chart_col1:
-    chart_data = raw_df.copy()
-    chart_data = chart_data.replace([np.inf, -np.inf], np.nan)
-    chart_data = chart_data.dropna(subset=["rv_20d", "edge_score"])
-
-    if chart_data.empty:
-        st.info("Not enough data to plot RV vs Edge Score.")
-    else:
-        scatter = (
-            alt.Chart(chart_data)
-            .mark_circle(size=80, opacity=0.9)
-            .encode(
-                x=alt.X("rv_20d", title="RV 20d (%)"),
-                y=alt.Y("edge_score", title="Daily Edge Score (%)"),
-                color=alt.condition(
-                    "datum.day_pct >= 0",
-                    alt.value("#22c55e"),  # green
-                    alt.value("#ef4444"),  # red
-                ),
-                tooltip=[
-                    "ticker",
-                    alt.Tooltip("last_price", title="Last Price", format=".2f"),
-                    alt.Tooltip("day_pct", title="Day %", format="+.2f"),
-                    alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
-                    alt.Tooltip("rv_60d", title="RV 60d", format=".2f"),
-                    alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
-                ],
-            )
-            .properties(height=320)
+if chart_data.empty:
+    st.info("Not enough data to plot RV vs Edge Score.")
+else:
+    scatter = (
+        alt.Chart(chart_data)
+        .mark_circle(size=80, opacity=0.9)
+        .encode(
+            x=alt.X("rv_20d", title="20d Realized Volatility (%)"),
+            y=alt.Y("edge_score", title="Daily Edge Score (%)"),
+            color=alt.condition(
+                "datum.day_pct >= 0",
+                alt.value("#22c55e"),  # green
+                alt.value("#ef4444"),  # red
+            ),
+            tooltip=[
+                "ticker",
+                alt.Tooltip("last_price", title="Last Price", format=".2f"),
+                alt.Tooltip("day_pct", title="Day %", format="+.2f"),
+                alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
+                alt.Tooltip("rv_60d", title="RV 60d", format=".2f"),
+                alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
+            ],
         )
+        .properties(height=320)
+    )
+    st.altair_chart(scatter, use_container_width=True)
 
-        st.altair_chart(scatter, width="stretch")
+st.markdown(
+    """
+**Chart 2 – Edge Score by Ticker**
 
-# Bar: Top 5 Edge Opportunities
-with chart_col2:
-    top5 = raw_df.copy()
-    top5 = top5.replace([np.inf, -np.inf], np.nan)
-    top5 = top5.dropna(subset=["edge_score"])
-    top5 = top5.sort_values("edge_score", ascending=False).head(5)
+Bars are sorted from highest to lowest Daily Edge Score.  
+Start at the left when you are hunting for ideas.
+"""
+)
 
-    if top5.empty:
-        st.info("Not enough data to plot Top Edge Opportunities.")
-    else:
-        bar = (
-            alt.Chart(top5)
-            .mark_bar()
-            .encode(
-                x=alt.X("ticker:N", title="Ticker"),
-                y=alt.Y("edge_score:Q", title="Daily Edge Score (%)"),
-                color=alt.value("#6366f1"),  # indigo-ish
-                tooltip=[
-                    "ticker",
-                    alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
-                    alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
-                    alt.Tooltip("day_pct", title="Day %", format="+.2f"),
-                ],
-            )
-            .properties(height=320)
+top_df = (
+    raw_df.replace([np.inf, -np.inf], np.nan)
+    .dropna(subset=["edge_score"])
+    .sort_values("edge_score", ascending=False)
+)
+
+if top_df.empty:
+    st.info("Not enough data to plot Edge Score by Ticker.")
+else:
+    bar = (
+        alt.Chart(top_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("ticker:N", title="Ticker"),
+            y=alt.Y("edge_score:Q", title="Daily Edge Score (%)"),
+            color=alt.value("#6366f1"),
+            tooltip=[
+                "ticker",
+                alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
+                alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
+                alt.Tooltip("day_pct", title="Day %", format="+.2f"),
+            ],
         )
-        st.altair_chart(bar, width="stretch")
+        .properties(height=320)
+    )
+    st.altair_chart(bar, use_container_width=True)
 
-# ---------------- Playbook card ----------------
-st.markdown("### Playbook – Strategy Fit by Ticker")
+st.markdown("---")
+
+# ---------------------------------------------------------------------
+# Trade Ideas – Playbook & “Today’s Best Play”
+# ---------------------------------------------------------------------
+st.subheader("Trade Ideas")
+
+# Best play = highest edge_score row (already computed)
+best_play_row = max_edge_row
+
+if best_play_row is not None:
+    best_play_text = _infer_playbook_row(best_play_row)
+    st.markdown("#### Today’s Best Play")
+    st.success(
+        f"**{best_play_row['ticker']}** – {best_play_text}",
+        icon="🚀",
+    )
+
+st.caption(
+    "These rule-based ideas mirror the regimes and edge buckets from the RL notebooks – "
+    "they’re a human-readable version of that logic."
+)
+
+st.markdown("#### Strategy Fit by Ticker")
 
 selected_ticker = st.selectbox(
-    "Choose a ticker for today's playbook:",
+    "Choose a ticker for today’s playbook:",
     options=raw_df["ticker"].unique().tolist(),
 )
 
@@ -525,27 +846,95 @@ playbook_text = _infer_playbook_row(selected_row)
 
 st.info(f"**{selected_ticker} – {playbook_text}**", icon="🎯")
 
+st.markdown("---")
 
-# ---------------- Explainer ----------------
-st.markdown("### Big Picture")
-insights_df = styled.data if hasattr(styled, "data") else raw_df  # type: ignore[attr-defined]
-with st.expander("AI summary of today's volatility setup", expanded=False):
-    st.write(generate_ai_insights(insights_df.rename(columns=str)))
+# ---------------------------------------------------------------------
+# Big Picture – AI summary (on button click)
+# ---------------------------------------------------------------------
+st.subheader("Big Picture – AI Summary")
+
+ai_col1, ai_col2 = st.columns([0.25, 0.75])
+
+with ai_col1:
+    generate_clicked = st.button(
+        "Generate AI Summary",
+        help="Uses OpenAI to summarize today’s volatility landscape and highlight watchlist ideas.",
+    )
+
+with ai_col2:
+    st.markdown(
+        "Click to get a concise explanation of what this dashboard is saying, "
+        "written for both traders and hiring managers."
+    )
+
+with st.expander("View AI Summary", expanded=False):
+    if generate_clicked:
+        # Use the styled table’s underlying data if available, otherwise raw_df
+        df_for_ai = (
+            styled.data if hasattr(styled, "data") else raw_df  # type: ignore[attr-defined]
+        )
+        ai_text = generate_ai_insights(df_for_ai.rename(columns=str))
+        st.write(ai_text)
+    else:
+        st.write(
+            "Click **Generate AI Summary** above to create a short narrative for today’s setup."
+        )
+
+st.markdown("---")
+
+# ---------------------------------------------------------------------
+# Help + Notebook workflow section
+# ---------------------------------------------------------------------
+with st.expander("How I walk this dashboard"):
+    st.markdown(
+        """
+        - Start with **Today at a Glance** to explain the volatility environment.
+        - Use **Daily Edge Ranking** to pick 1–2 tickers and narrate why they stand out.
+        - Point to **Volatility & Edge Overview** to show you understand risk vs opportunity.
+        - Close with **Trade Ideas** to connect the stats back to practical options structures.
+        """
+    )
+
+st.subheader("Help – How to Read This Dashboard")
 
 st.markdown(
     """
-### How to read this
-
 - **Last Price** – latest close from Yahoo Finance  
-- **Day %** – today’s % move vs. prior close (green = up, red = down)  
+- **Day %** – today’s % move vs prior close (green = up, red = down)  
 - **RV 20d / RV 60d** – annualized realized volatility from Polygon based on the last 20 / 60 trading days  
 - **Daily Edge Score** – simple composite: average of |Day %| and RV 20d (for now)  
 
-Next versions will add:
+Future versions could add:
 
 - IV Rank and ATM IV  
 - Single-ticker deep dive with RV trend and options snapshot  
-- Export / notebook links and strategy suggestions
+- Export / strategy notebook templates
 """
 )
+
+st.markdown("### Under the Hood – Research Workflow")
+
+st.markdown(
+    """
+This live screener is backed by a full DuckDB + notebook pipeline:
+
+- **00 – Backfill & Data Ingest** – loads raw OHLCV into DuckDB and builds a clean, gap-free daily dataset per ticker.  
+- **01 – Volatility & EDA** – profiles returns, volatility regimes, and liquidity to make sure the universe and date ranges are tradeable.  
+- **02 – Feature Engineering** – builds the core edge score and volatility/liquidity features that later drive baselines and RL.  
+- **03 – Backtesting Signals** – turns features into simple rule-based strategies and equity curves to confirm they have economic signal.  
+- **04 – RL Environment** – wraps engineered features into a `VAETradingEnv` so we can compare learned RL behavior to the baselines.  
+- **05 – Baseline Policies** – benchmarks random / edge-threshold / regime-based policies on the same dataset.  
+- **06 – RL Training** – trains a tabular Q-learning agent and produces RL equity curves vs cash.  
+- **07 – Diagnostics & Interpretation** – validates that the RL agent behaves sensibly (by regime and edge bucket) and that the strategy is not a fluke.
+"""
+)
+
+st.markdown("---")
+
+st.caption(
+    "Built by Brandon Theard as part of the **Volatility Alpha Engine** project. "
+    "Source code: [GitHub repo](https://github.com/btheard3/volatility-alpha-engine) · "
+    "Contact: [LinkedIn](https://www.linkedin.com/in/brandon-theard-811b38131)"
+)
+# ---------------------------------------------------------------------
 
