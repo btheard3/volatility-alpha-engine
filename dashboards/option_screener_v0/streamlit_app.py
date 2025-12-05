@@ -1000,6 +1000,20 @@ This live screener is backed by a full DuckDB + notebook pipeline:
 """
 )
 
+with st.expander("🔗 Open the research notebooks on GitHub"):
+    st.markdown(
+        """
+- [00 – Backfill & Data Ingest](https://github.com/btheard3/volatility-alpha-engine/blob/main/notebooks/00_backfill.ipynb)
+- [01 – Volatility & EDA](https://github.com/btheard3/volatility-alpha-engine/blob/main/notebooks/01_eda_volatility_alpha.ipynb)
+- [02 – Feature Engineering](https://github.com/btheard3/volatility-alpha-engine/blob/main/notebooks/02_feature_engineering.ipynb)
+- [03 – Backtesting Signals](https://github.com/btheard3/volatility-alpha-engine-main/blob/main/notebooks/03_backtesting_signals.ipynb)
+- [04 – RL Environment](https://github.com/btheard3/volatility-alpha-engine/blob/main/notebooks/04_rl_environment.ipynb)
+- [05 – Baseline Policies](https://github.com/btheard3/volatility-alpha-engine/blob/main/notebooks/05_rl_baseline_policies.ipynb)
+- [06 – RL Training](https://github.com/btheard3/volatility-alpha-engine/blob/main/notebooks/06_rl_training_agent.ipynb)
+- [07 – Diagnostics & Interpretation](https://github.com/btheard3/volatility-alpha-engine/blob/main/notebooks/07_rl_diagnostics.ipynb)
+        """
+    )
+
 st.markdown("---")
 
 st.caption(
