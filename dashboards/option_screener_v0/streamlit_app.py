@@ -772,81 +772,99 @@ st.download_button(
 st.markdown("---")
 
 # ---------------------------------------------------------------------
-# Volatility & Edge charts (stacked, not side-by-side)
+# Volatility & Edge charts – side-by-side with explainers
 # ---------------------------------------------------------------------
 st.markdown("### Volatility & Edge Overview")
-st.caption(
-    "Chart 1 shows **20d realized volatility vs Daily Edge Score**. "
-    "Top-right dots are your highest-energy setups today. "
-    "Chart 2 ranks the universe by edge."
-)
 
-chart_data = raw_df.replace([np.inf, -np.inf], np.nan).dropna(
-    subset=["rv_20d", "edge_score"]
-)
+chart_col1, chart_col2 = st.columns(2)
 
-if chart_data.empty:
-    st.info("Not enough data to plot RV vs Edge Score.")
-else:
-    scatter = (
-        alt.Chart(chart_data)
-        .mark_circle(size=80, opacity=0.9)
-        .encode(
-            x=alt.X("rv_20d", title="20d Realized Volatility (%)"),
-            y=alt.Y("edge_score", title="Daily Edge Score (%)"),
-            color=alt.condition(
-                "datum.day_pct >= 0",
-                alt.value("#22c55e"),  # green
-                alt.value("#ef4444"),  # red
-            ),
-            tooltip=[
-                "ticker",
-                alt.Tooltip("last_price", title="Last Price", format=".2f"),
-                alt.Tooltip("day_pct", title="Day %", format="+.2f"),
-                alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
-                alt.Tooltip("rv_60d", title="RV 60d", format=".2f"),
-                alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
-            ],
-        )
-        .properties(height=320)
+# -------- Left: RV 20d vs Edge Score --------
+with chart_col1:
+    st.markdown("**Chart 1 – RV vs Edge Score**")
+
+    chart_data = (
+        raw_df.replace([np.inf, -np.inf], np.nan)
+        .dropna(subset=["rv_20d", "edge_score"])
     )
-    st.altair_chart(scatter, use_container_width=True)
 
-st.markdown(
-    """
-**Chart 2 – Edge Score by Ticker**
+    if chart_data.empty:
+        st.info("Not enough data to plot RV vs Edge Score.")
+    else:
+        scatter = (
+            alt.Chart(chart_data)
+            .mark_circle(size=80, opacity=0.9)
+            .encode(
+                x=alt.X("rv_20d", title="20d Realized Volatility (%)"),
+                y=alt.Y("edge_score", title="Daily Edge Score (%)"),
+                color=alt.condition(
+                    "datum.day_pct >= 0",
+                    alt.value("#22c55e"),  # green
+                    alt.value("#ef4444"),  # red
+                ),
+                tooltip=[
+                    "ticker",
+                    alt.Tooltip("last_price", title="Last Price", format=".2f"),
+                    alt.Tooltip("day_pct", title="Day %", format="+.2f"),
+                    alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
+                    alt.Tooltip("rv_60d", title="RV 60d", format=".2f"),
+                    alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
+                ],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(scatter, use_container_width=True)
 
-Bars are sorted from highest to lowest Daily Edge Score.  
-Start at the left when you are hunting for ideas.
+    with st.expander("🧠 How to read this chart", expanded=False):
+        st.markdown(
+            """
+- Each dot is a **ticker** in your basket.  
+- **Right** = more volatile (higher 20-day realized volatility).  
+- **Up** = higher Daily Edge Score (bigger move and/or higher vol).  
+- Top-right names are your **highest-energy setups** for today.  
+- Green dots are **up days**, red dots are **down days**.
 """
-)
-
-top_df = (
-    raw_df.replace([np.inf, -np.inf], np.nan)
-    .dropna(subset=["edge_score"])
-    .sort_values("edge_score", ascending=False)
-)
-
-if top_df.empty:
-    st.info("Not enough data to plot Edge Score by Ticker.")
-else:
-    bar = (
-        alt.Chart(top_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("ticker:N", title="Ticker"),
-            y=alt.Y("edge_score:Q", title="Daily Edge Score (%)"),
-            color=alt.value("#6366f1"),
-            tooltip=[
-                "ticker",
-                alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
-                alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
-                alt.Tooltip("day_pct", title="Day %", format="+.2f"),
-            ],
         )
-        .properties(height=320)
+
+# -------- Right: Edge Score by Ticker --------
+with chart_col2:
+    st.markdown("**Chart 2 – Edge Score by Ticker**")
+
+    top_df = (
+        raw_df.replace([np.inf, -np.inf], np.nan)
+        .dropna(subset=["edge_score"])
+        .sort_values("edge_score", ascending=False)
     )
-    st.altair_chart(bar, use_container_width=True)
+
+    if top_df.empty:
+        st.info("Not enough data to plot Edge Score by Ticker.")
+    else:
+        bar = (
+            alt.Chart(top_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("ticker:N", title="Ticker"),
+                y=alt.Y("edge_score:Q", title="Daily Edge Score (%)"),
+                color=alt.value("#6366f1"),
+                tooltip=[
+                    "ticker",
+                    alt.Tooltip("edge_score", title="Edge Score", format=".2f"),
+                    alt.Tooltip("rv_20d", title="RV 20d", format=".2f"),
+                    alt.Tooltip("day_pct", title="Day %", format="+.2f"),
+                ],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(bar, use_container_width=True)
+
+    with st.expander("🧠 How to read this chart", expanded=False):
+        st.markdown(
+            """
+- Bars are sorted from **highest** to **lowest** Daily Edge Score.  
+- Start on the **left** when you’re hunting for trade ideas.  
+- Higher bars = names where **today’s move + volatility** look most interesting.  
+- Use this like a **ranked watchlist** for further notebook or options work.
+"""
+        )
 
 st.markdown("---")
 
