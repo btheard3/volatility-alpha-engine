@@ -1,0 +1,37 @@
+steps:
+  # 1) Build Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      [
+        'build',
+        '-t',
+        'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA',
+        '.'
+      ]
+
+  # 2) Push image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      [
+        'push',
+        'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA'
+      ]
+
+  # 3) Deploy to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      [
+        'run',
+        'deploy',
+        'vae-screener',
+        '--image',
+        'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA',
+        '--region',
+        'us-central1',
+        '--platform',
+        'managed',
+        '--allow-unauthenticated'
+      ]
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA'

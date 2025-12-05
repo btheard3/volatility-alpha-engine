@@ -758,7 +758,7 @@ Higher **Daily Edge Score** = more interesting today (bigger move and/or higher 
 )
 
 styled = _styled_table(raw_df)
-st.dataframe(styled, use_container_width=True)
+st.dataframe(styled, width="stretch")
 
 csv_download = raw_df.to_csv(index=False).encode("utf-8")
 st.download_button(
@@ -812,7 +812,7 @@ with chart_col1:
             )
             .properties(height=320)
         )
-        st.altair_chart(scatter, use_container_width=True)
+        st.altair_chart(scatter)
 
     with st.expander("🧠 How to read this chart", expanded=False):
         st.markdown(
@@ -854,7 +854,7 @@ with chart_col2:
             )
             .properties(height=320)
         )
-        st.altair_chart(bar, use_container_width=True)
+        st.altair_chart(bar)
 
     with st.expander("🧠 How to read this chart", expanded=False):
         st.markdown(

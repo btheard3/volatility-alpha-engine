@@ -1,0 +1,25 @@
+# Ignore git stuff
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# Local data, notebooks, and dev artifacts
+data/
+notebooks/
+.env
+.env.*
+*.log
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
+Thumbs.db
