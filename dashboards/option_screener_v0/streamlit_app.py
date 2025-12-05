@@ -744,7 +744,7 @@ st.subheader("Daily Edge Ranking")
 
 st.caption(
     "Names are sorted by **Daily Edge Score** – start at the top when you’re "
-    "looking for ideas or walking a recruiter through the dashboard."
+    "looking for ideas."
 )
 
 # ---------------------------------------------------------------------
