@@ -12,6 +12,22 @@ def _get_db_path() -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
+# global DB_PATH so other modules can import it
+DB_PATH: Path = _get_db_path()
+
+# thin wrapper to match the old API used elsewhere
+def connect_duckdb(
+    db_path: Optional[Path] = None,
+    read_only: bool = False,
+) -> duckdb.DuckDBPyConnection:
+    """
+    Generic helper to open a DuckDB connection.
+
+    Other modules call this so we keep the signature simple.
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    return duckdb.connect(str(db_path), read_only=read_only)
 
 def get_connection() -> duckdb.DuckDBPyConnection:
     db_path = _get_db_path()
