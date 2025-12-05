@@ -39,6 +39,7 @@ from src.polygon_client import (  # type: ignore  # noqa: E402
 st.set_page_config(
     page_title="Volatility Alpha Engine – Option Screener V1",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 # Center the main column and narrow it for a “phone scroll” feel
