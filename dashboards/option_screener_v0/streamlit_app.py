@@ -47,7 +47,7 @@ st.markdown(
     """
     <style>
     .block-container {
-        max-width: 960px;
+        max-width: 880px;
         padding-top: 1.5rem;
         padding-bottom: 4rem;
         margin: auto;
