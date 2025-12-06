@@ -11,6 +11,12 @@ VAE powers two major surfaces:
 **What VAE Does in One Sentence**
 
 > VAE transforms raw OHLCV data into volatility/edge features, evaluates them through signal backtests, and uses them to train an interpretable RL agent designed to outperform naïve trading policies.
+
+## Live Demo
+
+-  Deployed app (GCP Cloud Run): https://vae-screener-10109427624.us-central1.run.app
+-  Best viewed on desktop with the sidebar expanded (use the `>` toggle if needed).
+
 ---
 
 ## Project Structure
