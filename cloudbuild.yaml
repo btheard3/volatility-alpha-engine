@@ -1,37 +1,41 @@
+# cloudbuild.yaml – CI/CD for VAE Streamlit app
+
+options:
+  # This is the key fix for your error:
+  # since your trigger specifies build.service_account,
+  # we must use CLOUD_LOGGING_ONLY / NONE or a logs bucket.
+  logging: CLOUD_LOGGING_ONLY
+
 steps:
-  # 1) Build Docker image
+  # 1) Build the Docker image from your Dockerfile
   - name: 'gcr.io/cloud-builders/docker'
     args:
       [
         'build',
         '-t',
-        'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA',
+        'us-central1-docker.pkg.dev/volatility-alpha-engine/vae-repo/vae-screener:$SHORT_SHA',
         '.'
       ]
 
-  # 2) Push image to Artifact Registry
+  # 2) Push the image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args:
       [
         'push',
-        'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA'
+        'us-central1-docker.pkg.dev/volatility-alpha-engine/vae-repo/vae-screener:$SHORT_SHA'
       ]
 
   # 3) Deploy to Cloud Run
-  - name: 'gcr.io/cloud-builders/gcloud'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
     args:
       [
-        'run',
-        'deploy',
-        'vae-screener',
-        '--image',
-        'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA',
-        '--region',
-        'us-central1',
-        '--platform',
-        'managed',
+        'run', 'deploy', 'vae-screener',
+        '--image', 'us-central1-docker.pkg.dev/volatility-alpha-engine/vae-repo/vae-screener:$SHORT_SHA',
+        '--region', 'us-central1',
+        '--platform', 'managed',
         '--allow-unauthenticated'
       ]
 
 images:
-  - 'us-central1-docker.pkg.dev/$PROJECT_ID/volatility-alpha-engine/vae-repo/vae-screener:$COMMIT_SHA'
+  - 'us-central1-docker.pkg.dev/volatility-alpha-engine/vae-repo/vae-screener:$SHORT_SHA'
