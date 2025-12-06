@@ -46,16 +46,33 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    /* Main content width + padding */
     .block-container {
-        max-width: 880px;
-        padding-top: 1.5rem;
-        padding-bottom: 4rem;
+        max-width: 860px;      /* a bit narrower for less "full-screen" feel */
+        padding-top: 1.2rem;
+        padding-bottom: 3rem;
         margin: auto;
     }
-    /* Make metrics slightly bolder / bigger */
+
+    /* Global headings – make H1/H2 a bit smaller so the hero title isn't shouting */
+    h1 {
+        font-size: 2.2rem !important;
+        line-height: 1.25 !important;
+    }
+    h2 {
+        font-size: 1.4rem !important;
+        line-height: 1.3 !important;
+    }
+
+    /* Make metrics slightly smaller but still readable */
     [data-testid="stMetricValue"] {
-        font-size: 1.4rem;
+        font-size: 1.2rem;
         font-weight: 600;
+    }
+
+    /* Optional: slightly smaller base text to reduce the "huge" feeling */
+    .stMarkdown, .stText, .stCaption, p {
+        font-size: 0.95rem;
     }
     </style>
     """,
