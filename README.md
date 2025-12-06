@@ -50,7 +50,7 @@ Explores returns, realized volatility regimes, gaps, and liquidity effects.
 **02 – Feature Engineering**
 Creates volatility-aware predictive features, including:
 
-- /60d realized volatility
+- 20d/60d realized volatility
 
 - Edge score (VAE’s core feature)
 
@@ -67,7 +67,7 @@ Evaluates simple benchmark strategies:
 
 - Momentum/reversal flavor tests
 
-Produces equity curves and Sharpe/max-drawdown diagnostics
+Produces equity curves and Sharpe/max-drawdown diagnostics.
 
 **04 – RL Environment Skeleton**
 Implements the first production-ready version of:
