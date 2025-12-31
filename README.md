@@ -1,320 +1,274 @@
 # Volatility Alpha Engine (VAE)
 
-**Volatility Alpha Engine** is a research-grade quantitative trading framework designed to analyze volatility regimes, engineer predictive features, backtest rule-based signals, and train a reinforcement-learning (RL) agent on next-day return dynamics.
+## Overview
 
-VAE powers two major surfaces:
+**Volatility Alpha Engine (VAE)** is a research-driven quantitative trading system designed to study how volatility regimes affect decision quality, signal reliability, and expected returns.
 
-1. The research pipeline (DuckDB + notebooks)
+The project is built around a simple but often ignored premise:
 
-2. The live volatility screener (Streamlit + Polygon + Docker + GCP Cloud Run)
+> Volatility is not opportunity — it is uncertainty.
+And uncertainty should change behavior.
 
-**What VAE Does in One Sentence**
-
-> VAE transforms raw OHLCV data into volatility/edge features, evaluates them through signal backtests, and uses them to train an interpretable RL agent designed to outperform naïve trading policies.
-
-## Live Demo
-
--  Deployed app (GCP Cloud Run): https://vae-screener-10109427624.us-central1.run.app
--  Best viewed on desktop with the sidebar expanded (use the `>` toggle if needed).
+Rather than predicting price direction, VAE focuses on determining when market participation is statistically justified and when restraint dominates.
 
 ---
 
-## Project Structure
+## Why This Is a Problem
 
-```text
-volatility-alpha-engine/
-├── dashboards/
-│   └── option_screener_v1/streamlit_app.py     # Live deployed screener (Cloud Run + Docker)
-├── data/
-│   └── volatility_alpha.duckdb                 # Engineered feature store in DuckDB
-├── notebooks/
-│   ├── 00_backfill.ipynb
-│   ├── 01_eda_volatility_alpha.ipynb
-│   ├── 02_feature_engineering.ipynb
-│   ├── 03_backtesting_signals.ipynb
-│   ├── 04_rl_environment.ipynb
-│   ├── 05_baseline_policies.ipynb
-│   ├── 06_rl_training_qlearning.ipynb
-│   └── 07_diagnostics_interpretation.ipynb
-├── src/                                        # Polygon client, DB utilities, feature builders
-├── tests/
-├── Dockerfile
-├── cloudbuild.yaml                             # CI/CD: GitHub → Cloud Build → Cloud Run
-├── requirements.txt
-└── README.md
+Most trading and decision systems implicitly assume:
+
+- More activity = more opportunity
+
+- Volatility increases edge
+
+- Models should always act
+
+In reality, volatility often signals **lower information quality**, unstable regimes, and degraded signal reliability.
+
+The true failure mode is not bad prediction — it is overconfidence under uncertainty.
+
+This problem generalizes beyond trading to:
+
+- Product experimentation
+
+- Risk modeling
+
+- Forecasting
+
+- Automated decision systems
+
+VAE treats *abstention* as a valid and sometimes optimal decision.
+
+---
+
+## Research Question
+
+VAE investigates three core questions:
+
+1. Do volatility regimes materially change return expectancy?
+
+2. Can simple, interpretable filters reduce drawdowns before ML is applied?
+
+3. Can a learning agent discover when not to trade without being explicitly told?
+
+The objective is not alpha maximization, but decision discipline.
+
+---
+
+## Dataset
+
+**Market Data**
+
+- Source: Polygon.io
+
+- Data: Daily OHLCV bars (U.S. equities)
+
+- Usage:
+
+    - Return computation
+
+    - Realized volatility estimation
+
+    - Regime labeling
+
+    - RL reward calculation
+
+    - Live screener metrics
+
+**Storage**
+
+- All cleaned and engineered data is cached locally in DuckDB:
+```bash
+data/volatility_alpha.duckdb
 ```
+- DuckDB serves as a lightweight, reproducible analytical feature store
+- Models operate only on derived features, never raw prices
+
 ---
 
-**Notebooks Overview**
+## Methodology
 
-**00 – Backfill & Data Ingest**
-Pulls historical price data, normalizes timestamps, and builds a clean OHLCV dataset in DuckDB.
+1. **Exploratory Analysis**
 
-**01 – Volatility & EDA**
-Explores returns, realized volatility regimes, gaps, and liquidity effects.
+Initial analysis evaluates:
 
-**02 – Feature Engineering**
-Creates volatility-aware predictive features, including:
+- Return distributions across volatility regimes
 
-- 20d/60d realized volatility
+- Volatility clustering and persistence
 
-- Edge score (VAE’s core feature)
+- Liquidity effects
+
+- Regime-dependent instability
+
+This establishes that volatility meaningfully alters decision context, not just return magnitude.
+
+2. **Feature Engineering**
+
+Core features include:
+
+- 20-day and 60-day realized volatility
+
+- Volatility regime labels
 
 - Liquidity filters
 
-- Regime labels
+- Edge score (VAE’s primary decision feature)
 
-**03 – Backtesting Signals**
-Evaluates simple benchmark strategies:
+All features are explicitly designed to be interpretable and regime-aware.
 
-- Edge-threshold
+3. **Signal Backtesting**
 
-- Regime-based
+Baseline strategies are tested before ML is introduced:
 
-- Momentum/reversal flavor tests
+- Edge-threshold rules
 
-Produces equity curves and Sharpe/max-drawdown diagnostics.
+- Regime-conditioned entries
 
-**04 – RL Environment Skeleton**
-Implements the first production-ready version of:
+- Momentum vs mean-reversion variants
+
+Evaluation includes:
+
+- Equity curves
+
+- Sharpe ratios
+
+- Maximum drawdown
+
+- Regime-level performance breakdowns
+
+These baselines answer a prerequisite question:
+
+*Is there any edge to learn from at all?*
+
+4. **Reinforcement Learning Setup**
+
+A custom Gym-style environment is implemented:
+```python
+
+class VAETradingEnv(gym.Env):
+    ...
 ```
-class VAETradingEnv(gym.Env)
-```
-Used for step-by-step RL training
+- **State**: (volatility regime, edge bucket)
 
-**05 – Baseline Policies**
-Backtests random, simple heuristics, and regime policies to benchmark RL performance.
+- **Action**: flat vs long
 
-**06 – RL Agent Training (Q-Learning Prototype)**
-Trains a tabular agent on:
+- **Reward**: next-day return
 
-- State = (volatility regime, edge bucket)
+- **Algorithm**: tabular Q-learning
 
-- Action = (flat vs long)
+The agent’s task is not prediction accuracy, but selective participation.
 
-- Reward = next-day return
+5. **Baselines vs RL**
 
-**07 – Diagnostics & Interpretation (Production Version)**
-Turns the RL results into a trading narrative:
+RL performance is benchmarked against:
 
-- When the agent trades
+- Random policy
 
-- Which regimes it avoids
+- Always-in policy
 
-- When edges behave predictably
+- Simple regime heuristics
 
-- RL vs baseline curves
+The RL agent is only considered useful if it outperforms these controls by trading less, not more.
 
----
+## Results
 
-# Data Sources & API Strategy
+Key findings:
 
-1. **Historical Market Data**
+- Volatility regimes materially alter return expectancy
 
-- **Polygon.io**
+- Many high-volatility regimes are net-negative for participation
 
-    - Realized volatility calculations
+- Simple volatility-aware filters already reduce drawdowns
 
-    - OHLCV bars for backtesting
+- The RL agent learns to avoid unstable regimes
 
-    - Live RV/price metrics for the Streamlit screener
+- Performance gains come primarily from inaction, not directional forecasting
 
-- **Local cache via DuckDB**
+The dominant edge is knowing when uncertainty is too high to act.
 
-    - All cleaned and engineered features live in `data/volatility_alpha.duckdb`
+## Failure Modes & Limitations
 
-    - Ensures fast, reproducible research runs
+This project explicitly documents its boundaries:
 
-    - Minimizes API calls and avoids rate-limit issues
+- No transaction cost modeling
 
-2. API Key Strategy
+- No leverage or position sizing
 
-To avoid Polygon rate-limit issues across multiple projects (VAE, Sentinel, RL trader):
+- Discrete state space limits expressiveness
 
-✔ Use multiple free-tier keys only for dev
-✔ Use one production key, stored in:
+- Q-learning chosen for interpretability, not peak performance
 
-- `.env` locally
+- Equity-only scope (options planned, not implied)
 
-- Cloud Run service variables (secure & encrypted)
+VAE is framed as a research system, not a production trading bot.
 
-✔ Long-term plan:
-Move to **Polygon Paid Tier** or **Tiingo** for 50,000–100,000 requests/day.
+## Live Screener
 
-3. **Live Screener (GCP Cloud Run)**
+A lightweight Streamlit application exposes VAE’s volatility and edge metrics in real time.
 
-- Containerized with Docker
+- Deployment: Docker + GCP Cloud Run
 
-- Public HTTPS endpoint
+- URL: https://vae-screener-10109427624.us-central1.run.app
 
-- Auto-scales to zero → free until hit
+- Purpose: Regime inspection and discretionary decision support
 
-- CI/CD via Cloud Build triggers → push to GitHub = redeploy automatically
+The screener mirrors the research pipeline exactly — no hidden logic.
 
-4. Research Compute
+## Reproducibility
 
-- Local/WSL DuckDB computations
+- Deterministic notebook execution
 
-- Optional migration to BigQuery for scalable signal testing (stretch goal)
+- Local DuckDB feature store
 
----
+- No proprietary infrastructure required
 
-# Trade Journal Module (Upcoming)
+- Runs fully on a local machine or via Docker
 
-This is the missing piece that turns VAE from “research project” into a “real trading system.”
-It will integrate with:
+Notebooks are intended to be run sequentially from `00` → `07`.
 
-- The VAE screener output
-
-- Future RL decisions
-
-- User-entered trades
-
-**Planned Features**
-
-✔ Log trades (direction, size, rationale, screenshot of chart)
-✔ Auto-tag by volatility regime + edge bucket
-✔ Compute P&L, win rate, expectancy
-✔ Learn which trades perform best for the user
-✔ Feed back into ML/RL training (“meta-learning lite”)
-
-> The system doesn’t just generate signals — it learns from the trader’s behavior and P&L to refine model features and RL reward shaping.
-
----
-
-# ML & RL Expansion Roadmap
-
-**Phase 1 — Already Implemented**
-
-- Realized volatility features
-
-- Daily edge score
-
-- Q-learning prototype
-
-- Backtests + diagnostics
-
-**Phase 2 — Near-Term Additions**
-
-- Logistic regression edge classifier
-
-- Gradient boosting model (LightGBM / XGBoost)
-
-- Custom reward shaping for RL
-
-- Multi-action RL (flat, long, short, reduce size)
-
- **Phase 3 — Full RL Options Trading Engine**
-
-- Gym-compatible environment with Greeks (Δ, Γ, Θ, Vega)
-
-- State embedding:
-
-    - 20d/60d RV
-
-    - IV rank (from Polygon options API)
-
-    - Edge score
-
-    - Market regime estimates
-
-- Actor-Critic agent
-
-- Position sizing algorithm
-
-**Phase 4 — Broker Integration**
-
-- Paper trading via Webull / Tastytrade / Alpaca
-
-- Real order execution (long horizon goal)
-
----
-
-Tech Stack
-
-- **Python 3.11+**
-
-- **DuckDB** for analytics storage
-
-- **Pandas / NumPy** for data wrangling
-
-- **Matplotlib** for research plots
-
-- **Tabular Q-Learning** for RL prototype
-
-**How to Run the Project**
-
-**1. Create and activate a virtual environment**
-
-```
-python -m venv .venv
-source .venv/bin/activate         # Linux/WSL
-# .venv\Scripts\activate          # Windows
+Repository Structure
+```text
+volatility-alpha-engine/
+├── notebooks/        # Research pipeline
+├── data/             # DuckDB feature store
+├── dashboards/       # Live Streamlit screener
+├── src/              # Data + feature utilities
+├── Dockerfile
+├── cloudbuild.yaml
+└── requirements.txt
 ```
 
-**2. Install dependencies**
-```
-pip install -r requirements.txt
-```
+## What This Project Demonstrates
 
-**3. Ensure DuckDB file is present**
+- Decision-making under uncertainty
 
-Place the DuckDB database at:
-```
-data/volatility_alpha.duckdb
-```
-(Notebook paths assume this location.)
+- Volatility-aware feature engineering
 
-Run the notebooks in order
+- Baseline-first ML evaluation
 
-**Recommended order**:
+- Reinforcement learning used conservatively
 
-1. `00_backfill.ipynb`
+- Research-to-deployment ownership
 
-2. `01_eda_volatility_alpha.ipynb`
+- Clear articulation of limitations and failure modes
 
-3. `02_feature_engineering.ipynb`
+## Future Work
 
-4. `03_backtesting_signals.ipynb`
+- Options-aware state space (Greeks, IV rank)
 
-5. `04_rl_environment.ipynb`
+- Continuous state embeddings
 
-6. `05_baseline_policies.ipynb`
+- Actor-Critic agents
 
-7. `06_rl_training_qlearning.ipynb`
+- Trade journal feedback loop
 
-8. `07_diagnostics_interpretation.ipynb`
+- Paper trading integration
 
-By the end, you will have:
+## Author
 
-- Engineered features & edge scores stored in DuckDB
+Brandon Theard
+GitHub: https://github.com/btheard3
 
-- Baseline strategy benchmarks
+LinkedIn: https://www.linkedin.com/in/brandon-theard-811b38131
 
-- A trained Q-learning policy
 
-- Diagnostics explaining when and why the RL agent trades
-
----
-
-# Contributing
-
-Future contributors can:
-
-- Add new volatility features
-
-- Build new baselines
-
-- Improve RL reward shaping
-
-- Help with React dashboard integration
-
----
-
-Author
-
-🔹 Brandon Theard
-
-GitHub → https://github.com/btheard3
-
-LinkedIn → https://www.linkedin.com/in/brandon-theard-811b38131
